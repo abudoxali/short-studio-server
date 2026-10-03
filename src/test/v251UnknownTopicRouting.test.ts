@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 
-import { matchFactPack } from "../server/v2/content-ai/factPacks";
 import { LocalContentAIProvider } from "../server/v2/content-ai/localProvider";
 import { OllamaContentAIProvider } from "../server/v2/content-ai/ollamaProvider";
 import { GeminiContentAIProvider } from "../server/v2/content-ai/geminiProvider";
@@ -8,21 +7,18 @@ import { ContentAIRegistry } from "../server/v2/content-ai/registry";
 import { Config } from "../config";
 
 /**
- * V2.4 PASS 5.1 - UNKNOWN FACTUAL TOPIC ROUTING
- * ----------------------------------------------
- * These three topics are deliberately NOT covered by any of the six curated
- * fact packs (airplane_windows_rounded, phone_battery_slow_after_80,
- * sky_is_blue, ice_floats, brain_freeze, microwave_uneven_heating). The
- * point of this suite is NOT to make these three specific questions
- * "work" by hardcoding three more fact packs - it is to verify the engine
- * is HONEST about not knowing them: it must never fabricate a confident
- * explanation, and it must route the customer to either a real Content AI
- * provider (when one is configured and healthy) or a clearly-labeled
- * low-confidence state (when none is available), rather than silently
- * rendering generic filler as if it were real content. The customer-safe
- * job-creation block itself is covered end-to-end in v2.test.ts, which
- * already has the FakeDb/router harness this suite would otherwise have to
- * duplicate.
+ * UNKNOWN TOPIC HONESTY
+ * --------------------
+ * These topics are deliberately NOT covered by any curated content (the old
+ * hard-coded fact packs and TOPIC_REGISTRY benchmark scripts were removed in
+ * the production-intelligence recovery - the engine must be honest about
+ * coverage rather than pretend). The deterministic Basic planner never
+ * fabricates an explanation: it marks output contentProvenance
+ * BASIC_FALLBACK + contentConfidence low, anchors narration to the
+ * customer's extracted topic, and never splices the raw question in as
+ * spoken copy. The real creative answer for these topics is the Ollama
+ * creative planner, which either produces MODEL_GENERATED content or fails
+ * with an explicit planner error.
  */
 const UNKNOWN_TOPICS = [
   "Why does metal feel colder than wood at the same room temperature?",
@@ -30,17 +26,9 @@ const UNKNOWN_TOPICS = [
   "Why do cats' eyes glow in the dark?",
 ];
 
-describe("V2.4 Pass 5.1: unknown topics are genuinely uncovered by the fact-pack library", () => {
+describe("Basic planner is honest, not confidently fabricated, for unknown topics", () => {
   for (const topic of UNKNOWN_TOPICS) {
-    it(`matchFactPack returns null for: "${topic}"`, () => {
-      expect(matchFactPack(topic, false)).toBeNull();
-    });
-  }
-});
-
-describe("V2.4 Pass 5.1: LocalContentAIProvider is honest, not confidently fabricated, for unknown topics", () => {
-  for (const topic of UNKNOWN_TOPICS) {
-    it(`marks low confidence / SAFE_GENERIC instead of inventing an explanation for: "${topic}"`, async () => {
+    it(`marks BASIC_FALLBACK / low confidence instead of inventing an explanation for: "${topic}"`, async () => {
       const provider = new LocalContentAIProvider();
       const spec = await provider.generateProductionSpec({
         prompt: topic,
@@ -48,20 +36,21 @@ describe("V2.4 Pass 5.1: LocalContentAIProvider is honest, not confidently fabri
         requestedDurationSeconds: 20,
       });
 
-      expect((spec.metadata as any)?.contentProvenance).toBe("SAFE_GENERIC");
+      expect((spec.metadata as any)?.contentProvenance).toBe("BASIC_FALLBACK");
       expect((spec.metadata as any)?.contentConfidence).toBe("low");
-      expect((spec.metadata as any)?.factPackId).toBeUndefined();
+      expect((spec.metadata as any)?.basicMode).toBe(true);
 
-      // The generic fallback must never splice the raw topic text in as if
-      // it were a real explanation - that would look like a fabricated fact.
+      // The basic fallback must never splice the raw question text in as if
+      // it were a written line - that would look like a fabricated fact.
       const allNarration = spec.scenes.map((s) => s.narration).join(" ").toLowerCase();
       expect(allNarration).not.toContain(topic.toLowerCase().replace(/[?.]/g, ""));
+      expect(allNarration).not.toContain("create a");
     });
   }
 });
 
-describe("V2.4 Pass 5.1: registry precedence for unknown topics - Ollama/Gemini first when healthy, honest fallback otherwise", () => {
-  it("an unconfigured Ollama degrades to the deterministic Local provider without throwing", async () => {
+describe("Registry precedence - Ollama/Gemini first when configured, labelled Basic otherwise", () => {
+  it("an unconfigured Ollama degrades to the labelled Basic planner without throwing", async () => {
     const ollama = new OllamaContentAIProvider("", "test-model");
     const gemini = new GeminiContentAIProvider(undefined);
     expect(ollama.isConfigured).toBe(false);
@@ -72,7 +61,9 @@ describe("V2.4 Pass 5.1: registry precedence for unknown topics - Ollama/Gemini 
       language: "en",
       requestedDurationSeconds: 20,
     });
-    expect((spec.metadata as any)?.contentProvenance).toBe("SAFE_GENERIC");
+    expect((spec.metadata as any)?.contentProvenance).toBe("BASIC_FALLBACK");
+    expect((spec.metadata as any)?.fallbackUsed).toBe(true);
+    expect((spec.metadata as any)?.fallbackReason).toMatch(/OLLAMA_BASE_URL/);
   });
 
   it("registry order is Ollama (if configured) -> Gemini (if configured) -> deterministic Local AI", () => {

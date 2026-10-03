@@ -161,7 +161,7 @@ function cleanPromptDirectives(prompt: string, isAr: boolean): string {
   let cleaned = prompt;
   if (isAr) {
     cleaned = cleaned
-      .replace(/^(اعمل|أنشئ|اصنع|صمم|سوي|سويلي|اكتب)\s+(فيديو|شورت|مقطع|سكريبت|إعلان)?\s*(عن|حول|بخصوص)?/i, "")
+      .replace(/^(اعمل|أنشئ|اصنع|صمم|سوي|سويلي|اكتب|عايز|عاوز|عايزين|عاوزين|عايزة|عاوزة|بدنا|نبي)\s+(فيديو|شورت|مقطع|سكريبت|إعلان|إعلاني|اعلاني|محتوى)?\s*(عن|حول|بخصوص)?/i, "")
       .replace(/فيديو\s+(مدته|طوله|بمدة)?\s*\d+\s*(ثانية|ثواني|ثوان|دقيقة)?/i, "")
       .replace(/(بدقة|بجودة)\s*(عالية|1080p|4k)?/i, "")
       .replace(/(باللهجة|لهجة)\s*(المصرية|السعودية|الخليجية|العامية)?/i, "");
@@ -187,25 +187,35 @@ function cleanPromptDirectives(prompt: string, isAr: boolean): string {
  * they used to request it ("make a video", "15 seconds", "for TikTok", etc.).
  * Meta wording must NEVER appear in narration or captions.
  */
-export function stripMetaInstructions(text: string, isAr: boolean): string {
+export function stripMetaInstructions(
+  text: string,
+  isAr: boolean,
+  options: { forNarration?: boolean } = {},
+): string {
   let cleaned = text.trim();
   if (!cleaned) return cleaned;
 
   if (isAr) {
     // Arabic meta-instruction patterns - strip from any position
     cleaned = cleaned
-      .replace(/(?:اعمل|أنشئ|اصنع|صمم|سوي|سويلي|اكتب|اعملي|سوي لي)\s+(?:لي\s+)?(?:فيديو|شورت|مقطع|سكريبت|إعلان)?\s*(?:عن|حول|بخصوص|يناقش)?\s*/gi, "")
-      .replace(/عايز\s+(فيديو|شورت|مقطع|إعلان)?\s*(عن|حول|بخصوص)?\s*/gi, "")
-      .replace(/عاوز\s+(فيديو|شورت|مقطع|إعلان)?\s*(عن|حول|بخصوص)?\s*/gi, "")
+      .replace(/(?:اعمل|أنشئ|اصنع|صمم|سوي|سويلي|اكتب|اعملي|سوي لي|اشرح|اشرحلي|اشرح لي|اعرض)\s+(?:لي\s+)?(?:فيديو|شورت|مقطع|سكريبت|إعلان)?\s*(?:عن|حول|بخصوص|يناقش|فكرة|معنى|مفهوم)?\s*/gi, "")
+      .replace(/عايز(ين|ة|ي|ى)?\s+(فيديو|شورت|مقطع|إعلان|إعلاني|اعلاني|محتوى)?\s*(عن|حول|بخصوص)?\s*/gi, "")
+      .replace(/عاوز(ين|ة|ي|ى)?\s+(فيديو|شورت|مقطع|إعلان|إعلاني|اعلاني|محتوى)?\s*(عن|حول|بخصوص)?\s*/gi, "")
       .replace(/فيديو\s+(?:مدته|طوله|بمدة)?\s*\d+\s*(?:ثانية|ثواني|ثوان|ثوانى|دقيقة|دقائق)?\s*(?:عن|حول|بخصوص)?\s*/gi, "")
       .replace(/مدته?\s+\d+\s*(?:ثانية|ثواني|ثوان|ثوانى|دقيقة|دقائق)?\s*/gi, "")
+      .replace(/(?:^|\s)\d+\s*(?:ثانية|ثواني|ثوان|ثوانى|دقيقة|دقائق)(?=\s|$|[,.،])/gi, " ")
       .replace(/(?:باللهجة|لهجة)\s*(?:المصرية|السعودية|الخليجية|العامية|الشامية|المغربية)?\s*/gi, "")
       .replace(/(?:بدقة|بجودة)\s*(?:عالية|1080p|4k)?\s*/gi, "")
       .replace(/(?:رأسي|عمودي|9:16|16:9)\s*/gi, "")
       .replace(/(?:ابدأ|افتح|اختم)\s+(?:بـ|ب|بجملة|بـ)?\s*/gi, "")
-      .replace(/(?:ممنوع|لا تذكر|بدون|من غير|بلا)\s+/gi, "")
       .replace(/(?:الجمهور|الهدف|المستهدفين)\s*[:：]?\s*/gi, "")
       .replace(/(?:الهوك|المقدمة|الرسالة|النص|الدعوة|CTA|الكابشن|الترجمة|التعليق|المشاهد|المرئيات|الصوت)\s*[:：]\s*/gi, "");
+    if (!options.forNarration) {
+      // Negative-constraint instructions are stripped when cleaning PROMPT
+      // text - but inside generated narration a negation is real content and
+      // deleting it inverts meaning ("بدون تربة" -> "تربة").
+      cleaned = cleaned.replace(/(?:ممنوع|لا تذكر|بلا)\s+/gi, "");
+    }
   } else {
     // English meta-instruction patterns - strip from any position
     cleaned = cleaned
@@ -215,8 +225,12 @@ export function stripMetaInstructions(text: string, isAr: boolean): string {
       .replace(/(?:in|with)\s*(?:1080p|4k|high quality|vertical format|9:16|16:9|portrait|landscape)\s*/gi, "")
       .replace(/(?:style|tone|mood|audience|hook|CTA|voice|captions?|visuals?)\s*[:：]\s*\S+/gi, "")
       .replace(/(?:focus on|explain|mention|describe|show|cover|include|emphasize|highlight|talk about|discuss)\s+/gi, "")
-      .replace(/(?:no|without|do not include|don't include|exclude|never mention|avoid)\s+/gi, "")
       .replace(/(?:the audience is|your job is|the goal is|the purpose is|the video should|the short should)\s+/gi, "");
+    if (!options.forNarration) {
+      // See the Arabic branch above: negations are instructions in prompt
+      // text, but real meaning inside generated narration.
+      cleaned = cleaned.replace(/(?:no|without|do not include|don't include|exclude|never mention|avoid)\s+/gi, "");
+    }
   }
 
   // Clean up extra whitespace and leading punctuation left behind
@@ -256,11 +270,21 @@ function detectIntentType(prompt: string, isAr: boolean): PromptIntentContract["
   return isAr ? "brand_ad" : "educational";
 }
 
+/** Orchestration/stopword tokens that can never be part of a speakable
+ *  entity ("want a video", "15 seconds ad"). A bare number is never an
+ *  entity word either - "إعلاني 15" is a truncated duration, not a topic. */
+const ENTITY_STOPWORD_RE =
+  /^(?:اعمل|أنشئ|اصنع|صمم|سوي|سويلي|اكتب|اعرض|اشرح|عايز|عاوز|عايزين|عاوزين|عايزة|عاوزة|بدنا|نبي|فيديو|شورت|مقطع|سكريبت|إعلان|إعلاني|اعلان|اعلاني|محتوى|ثانية|ثواني|ثوان|ثوانى|دقيقة|دقائق|ث|عن|حول|بخصوص|بيناقش|ليناقش|معنى|مفهوم|قصير|قصيرة|create|make|generate|produce|write|build|video|short|tiktok|reel|script|ad|commercial|content|post|clip|about|for|on|of|a|an|the|that|which|seconds|secs|sec|minutes|mins|\d+)$/i;
+
 function extractCoreEntity(cleanedPrompt: string, isAr: boolean): string {
-  if (!cleanedPrompt) return isAr ? "الموضوع الرئيسي" : "the main subject";
+  const fallback = isAr ? "الموضوع الرئيسي" : "the main subject";
+  if (!cleanedPrompt) return fallback;
   const firstLine = cleanedPrompt.split(/[.\n]/)[0].trim();
-  const words = firstLine.split(/\s+/).filter((w) => w.length > 1);
-  if (words.length <= 4) return firstLine;
+  const words = firstLine
+    .split(/\s+/)
+    .map((w) => w.replace(/^[«»"'"'"']+|[«»"'"'"',،؛;:]+$/g, ""))
+    .filter((w) => w.length > 1 && !ENTITY_STOPWORD_RE.test(w));
+  if (words.length === 0) return fallback;
   return words.slice(0, 4).join(" ");
 }
 
@@ -408,7 +432,13 @@ export function buildPromptIntentContract(
   const quoted = extractQuotedPhrases(prompt);
   const negatives = extractNegativeConstraints(prompt);
   const cleaned = cleanPromptDirectives(prompt, isAr);
-  const coreEntity = extractCoreEntity(cleaned, isAr);
+  // A short quoted phrase («لمعة», "Ember & Wick") is the customer's own
+  // naming of the subject - the most reliable entity signal available.
+  const quotedEntity = quoted.find((q) => {
+    const w = q.trim().split(/\s+/).filter(Boolean);
+    return w.length >= 1 && w.length <= 4 && !ENTITY_STOPWORD_RE.test(w[0]);
+  });
+  const coreEntity = quotedEntity ?? extractCoreEntity(cleaned, isAr);
   const intentType = detectIntentType(prompt, isAr);
   const requestedTopic = cleaned || coreEntity;
 

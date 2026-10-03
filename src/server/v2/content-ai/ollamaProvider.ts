@@ -7,13 +7,21 @@ import type {
   ProviderValidationResult,
   SpecReviewResult,
 } from "./types";
-import type { ProductionSceneSpec, ProductionSpec } from "../../../types/productionSpec";
-import { validateProductionSpec } from "../../../types/productionSpec";
+import type { ProductionSpec } from "../../../types/productionSpec";
 import { inventsUngroundedClaim } from "../creative/ctaPolicy";
-import { containsRawPromptLeak } from "../quality/professionalVisualQuality";
 import { logger } from "../../../logger";
 import { buildPromptIntentContract } from "./promptIntentContract";
-import { enforceAndRepairPromptFidelity } from "../quality/promptFidelityGate";
+import { assembleProductionSpec, coercePlanShape, creativePlanSchema } from "./creativePlanner";
+
+export class ContentPlannerError extends Error {
+  constructor(
+    public readonly plannerCode: "planner_unavailable" | "planner_invalid_response",
+    message: string,
+  ) {
+    super(message);
+    this.name = "ContentPlannerError";
+  }
+}
 
 function extractJsonObject(text: string): unknown {
   const start = text.indexOf("{");
@@ -22,46 +30,20 @@ function extractJsonObject(text: string): unknown {
   return JSON.parse(text.slice(start, end + 1));
 }
 
-/**
- * The deterministic baseline already ran the full truth-safety pipeline
- * (resolveCtaProvenance, enforcePromptTruthSafety, raw-prompt-leak guard) on
- * its own scenes. Nothing re-checks the LLM's "improved" hook/narration/CTA/
- * scene intent after that, and the system prompt above only ASKS it not to
- * invent claims - it does not enforce that. This re-applies the same checks
- * per scene and per-field reverts to the (already safe) baseline value
- * whenever the LLM's version fails them, rather than discarding the whole
- * LLM response for one bad field.
- */
-function enforceTruthSafetyOnLlmScenes(
-  llmScenes: unknown,
-  baselineScenes: ProductionSceneSpec[],
-  prompt: string,
-): ProductionSceneSpec[] {
-  if (!Array.isArray(llmScenes)) return baselineScenes;
-  return baselineScenes.map((baselineScene, index) => {
-    const candidate = llmScenes[index];
-    if (!candidate || typeof candidate !== "object") return baselineScene;
-    const merged: ProductionSceneSpec = { ...baselineScene, ...(candidate as Partial<ProductionSceneSpec>) };
-    const narration = String(merged.narration || "");
-    const onScreenText = merged.onScreenText ? String(merged.onScreenText) : undefined;
-    const narrationUnsafe = inventsUngroundedClaim(narration, prompt) || containsRawPromptLeak(prompt, narration);
-    const onScreenUnsafe = onScreenText
-      ? inventsUngroundedClaim(onScreenText, prompt) || containsRawPromptLeak(prompt, onScreenText)
-      : false;
-    return {
-      ...merged,
-      narration: narrationUnsafe ? baselineScene.narration : merged.narration,
-      onScreenText: onScreenUnsafe ? baselineScene.onScreenText : merged.onScreenText,
-      // Duration and visual routing stay under the deterministic planner's
-      // control regardless of what the LLM proposed - those are timeline/
-      // provider-routing decisions, not creative copy.
-      durationSeconds: baselineScene.durationSeconds,
-      purpose: baselineScene.purpose,
-      sceneIndex: baselineScene.sceneIndex,
-    };
-  });
-}
+// Read at call time so a settings/env change applies without a process restart.
+const plannerTimeoutMs = () => Number(process.env.OLLAMA_TIMEOUT_MS || 45000);
+const PLANNER_MAX_ATTEMPTS = 2;
 
+/**
+ * Ollama-backed creative planner. The model receives only the compact intent
+ * contract and returns a compact creative plan (script + storyboard); the
+ * deterministic assembler in creativePlanner.ts owns structure, timing,
+ * provenance and every safety gate. Previous versions asked the model to
+ * round-trip an entire ProductionSpec, which produced multi-KB responses that
+ * outran the API request timeout and were silently replaced by the
+ * deterministic baseline on any failure. A failure now surfaces as a
+ * ContentPlannerError so callers can return an honest, actionable error.
+ */
 export class OllamaContentAIProvider implements ContentAIProvider {
   public readonly id = "ollama";
   public readonly displayName = "Ollama Local LLM Creative Director";
@@ -71,117 +53,203 @@ export class OllamaContentAIProvider implements ContentAIProvider {
   constructor(
     private baseUrl = process.env.OLLAMA_BASE_URL || "",
     private model = process.env.OLLAMA_MODEL || "qwen2.5:7b-instruct",
-  ) {}
+  ) { }
 
   public get isConfigured(): boolean {
     return Boolean(this.baseUrl);
   }
 
-  public async generateProductionSpec(params: GenerateSpecParams): Promise<ProductionSpec> {
-    if (!this.isConfigured) return this.fallback.generateProductionSpec(params);
-    // The baseline always runs first and is returned as-is on any failure
-    // below (section 4: "do not block the product" - a configured-but-
-    // unreachable Ollama endpoint, a malformed response, or a schema
-    // mismatch must degrade to the deterministic planner's output, not fail
-    // the job outright, which the previous version - no try/catch around
-    // the live call - would have done).
-    const baseline = await this.fallback.generateProductionSpec(params);
-    const contract = buildPromptIntentContract(params.prompt, {
-      language: params.language === "ar" ? "ar" : params.language === "en" ? "en" : "auto",
-      dialect: params.dialect,
-      durationSeconds: params.durationSeconds || params.requestedDurationSeconds,
-      contentStyle: params.contentStyle,
-    });
-    try {
-      const system = [
-        "You are ABUD Shorts Engine Creative Director.",
-        "Return only valid JSON matching the provided ProductionSpec object shape.",
-        "User prompt is authoritative. Preserve every literal user requirement in the promptIntentContract.",
-        "Negative instructions are prohibitions, never positive instructions.",
-        "Preserve durationSeconds, language, dialect, aspectRatio, quality, productionMode, visualMode, voiceProvider, and voiceId exactly.",
-        "Improve hook, spoken narration, CTA when explicitly grounded, scene intent, precise concrete stock search terms, motion intent, and editing rhythm.",
-        "Never invent a price, discount, phone number, WhatsApp number, testimonial, statistic, or claim that is not grounded in the customer's own prompt.",
-        "Stock search terms must be concrete visual subjects for each exact scene, never generic mood words.",
-        "For Egyptian Arabic, use conversational spoken Egyptian Arabic, not translated MSA.",
-        "Do not include subjective quality scores.",
-      ].join(" ");
-      const response = await axios.post(
-        `${this.baseUrl.replace(/\/$/, "")}/api/generate`,
-        {
-          model: this.model,
-          stream: false,
-          system,
-          prompt: JSON.stringify({ params, promptIntentContract: contract, baseline }),
-          format: "json",
-        },
-        { timeout: Number(process.env.OLLAMA_TIMEOUT_MS || 45000) },
-      );
-      const raw = typeof response.data?.response === "string" ? response.data.response : JSON.stringify(response.data);
-      const parsed = extractJsonObject(raw) as Record<string, unknown>;
-      // Truth safety is re-applied per scene/field below rather than trusted
-      // from the LLM - see enforceTruthSafetyOnLlmScenes.
-      const safeScenes = enforceTruthSafetyOnLlmScenes(parsed.scenes, baseline.scenes, params.prompt);
-      const llmCtaText = (parsed.cta as any)?.text;
-      const ctaSafe = typeof llmCtaText === "string" &&
-        !inventsUngroundedClaim(llmCtaText, params.prompt) &&
-        !containsRawPromptLeak(params.prompt, llmCtaText);
-      // Only the fields the system prompt actually asks the LLM to improve
-      // are taken from its response; every structural field (id, userPrompt,
-      // brandKit, captionStyle, ...) comes from the baseline regardless of
-      // what the LLM echoed back. Requiring an LLM to faithfully round-trip
-      // an entire ProductionSpec object just to change a few lines of copy
-      // is unnecessary and fragile - a response missing or mistyping any of
-      // those structural fields used to fail `validateProductionSpec`
-      // entirely and silently discard an otherwise-good improvement.
-      const spec = validateProductionSpec({
-        ...baseline,
-        title: typeof parsed.title === "string" && !containsRawPromptLeak(params.prompt, parsed.title) ? parsed.title : baseline.title,
-        scenes: safeScenes,
-        // The CTA channel/contact is a provenance decision baked into
-        // `baseline.cta` by resolveCtaProvenance - never let the LLM invent
-        // a different contact channel, only allow it to reword the safe text.
-        cta: {
-          ...baseline.cta,
-          text: ctaSafe ? llmCtaText : baseline.cta?.text,
-        },
-        contact: baseline.contact,
-        durationSeconds: baseline.durationSeconds,
-        language: baseline.language,
-        dialect: baseline.dialect,
-        aspectRatio: baseline.aspectRatio,
-        quality: baseline.quality,
-        productionMode: baseline.productionMode,
-        visualMode: baseline.visualMode,
-        voiceProvider: baseline.voiceProvider,
-        voiceId: baseline.voiceId,
-        metadata: {
-          ...(baseline.metadata || {}),
-          planner: "OllamaContentAIProvider",
-          contentProvider: "ollama",
-          plannerModel: this.model,
-          model: this.model,
-          fallbackPlanner: "LocalContentAIProvider",
-          contentProvenance: "MODEL_GENERATED",
-          contentConfidence: "high",
-        },
-      });
-      return enforceAndRepairPromptFidelity(spec, contract).spec;
-    } catch (error) {
-      logger.warn(
-        { err: error instanceof Error ? error.message : String(error), model: this.model },
-        "Ollama content generation failed; using the deterministic baseline instead",
-      );
-      return baseline;
-    }
+  private async callPlanner(system: string, prompt: string): Promise<unknown> {
+    const response = await axios.post(
+      `${this.baseUrl.replace(/\/$/, "")}/api/generate`,
+      { model: this.model, stream: false, system, prompt, format: "json", options: { temperature: 0.3 } },
+      { timeout: plannerTimeoutMs() },
+    );
+    const raw =
+      typeof response.data?.response === "string" ? response.data.response : JSON.stringify(response.data);
+    return extractJsonObject(raw);
   }
 
+  public async generateProductionSpec(params: GenerateSpecParams): Promise<ProductionSpec> {
+    // Ollama not configured at all is an explicit, declared degraded state:
+    // the Basic planner is the selected engine, and the spec metadata says so.
+    if (!this.isConfigured) {
+      const spec = await this.fallback.generateProductionSpec(params);
+      spec.metadata = {
+        ...(spec.metadata || {}),
+        planner: "LocalContentAIProvider",
+        fallbackUsed: true,
+        fallbackReason: "OLLAMA_BASE_URL not configured",
+        contentProvenance: "BASIC_FALLBACK",
+      };
+      return spec;
+    }
+
+    const isAr =
+      params.language === "ar" ||
+      (params.language !== "en" && /[\u0600-\u06FF]/.test(params.prompt));
+    const dialect = params.dialect && params.dialect !== "none" ? params.dialect : isAr ? "egyptian" : "none";
+    const languageLabel =
+      isAr && dialect === "egyptian"
+        ? "spoken Egyptian Arabic (عامية مصرية), never formal MSA"
+        : isAr
+          ? "Modern Standard Arabic"
+          : "English";
+    const durationSeconds =
+      params.requestedDurationSeconds ?? params.durationSeconds ?? params.duration ?? 30;
+    const contract = buildPromptIntentContract(params.prompt, {
+      language: isAr ? "ar" : "en",
+      dialect,
+      durationSeconds,
+      contentStyle: params.contentStyle,
+    });
+    const targetScenes = contract.estimatedSceneCount;
+
+    const system = [
+      "You are a short-form vertical video creative director and scriptwriter.",
+      "The customer brief below describes the video they want. Turn it into a complete creative plan and return ONLY JSON:",
+      '{"title": "...", "tone": "...", "scenes": [{"purpose": "hook|problem|solution|benefit|proof|cta", "narration": "...", "onScreenText": "...", "visualIntent": "...", "searchQueries": ["...", "..."]}], "cta": "optional", "expansionLines": ["optional extra supporting sentences"]}',
+      `Write all narration in ${languageLabel}, as fresh natural spoken lines - never copy sentences from the brief itself.`,
+      `When writing Arabic narration: keep established English technical terms in English exactly as people say them (API, cache, backend, frontend, server, database, HTTP, app, code, deploy) - never invent Arabic transliterations of English words and never write fake Arabic-sounding tech words. Plain everyday spoken Arabic is better than ornate phrasing.`,
+      `Total spoken narration must fit about ${durationSeconds}s of video across roughly ${targetScenes} scenes.`,
+      "Rules: 1) The brief is INPUT, not narration - never read its sentences back; 2) Never invent prices, discounts, discounts codes, phone numbers, WhatsApp, websites, testimonials, statistics or guarantees not present in the brief; 3) Honour every negative constraint; 4) onScreenText is a short punchy overlay line, not a duplicate of narration; 5) visualIntent describes the concrete shot this scene needs; 6) searchQueries MUST be written in English words only, even for Arabic briefs - they query an English stock-footage API. 3-5 SHORT concrete visual search phrases, each a different angle (subject / action / environment / detail / result) - never mood words like 'cinematic' or 'professional' and never Arabic; 7) each scene gets a DIFFERENT purpose (only the first may be 'hook', only the last may be 'cta'); 8) the final scene should deliver the takeaway or call-to-action.",
+    ].join("\n");
+
+    const requestPayload = {
+      brief: params.prompt,
+      intent: {
+        requestedTopic: contract.requestedTopic,
+        coreEntity: contract.coreEntity,
+        intentType: contract.intentType,
+        factualRequirements: contract.factualRequirements,
+        subjectEntities: contract.subjectEntities,
+        quotedPhrases: contract.quotedPhrases,
+        negativeConstraints: contract.negativeConstraints,
+        requestedExclusions: contract.requestedExclusions,
+        explicitHook: contract.explicitHook,
+        explicitMiddleMessage: contract.explicitMiddleMessage,
+        explicitCta: contract.explicitCta || contract.requestedCta.explicitText,
+        audience: contract.audience,
+        tone: contract.tone,
+        location: contract.location,
+        productOrBusiness: contract.productOrBusiness,
+        durationSeconds,
+        targetSceneCount: targetScenes,
+        language: contract.language,
+        dialect: contract.dialect,
+        contentStyle: params.contentStyle,
+      },
+    };
+
+    const started = Date.now();
+    let lastError: unknown = null;
+    let attempts = 0;
+    for (let attempt = 1; attempt <= PLANNER_MAX_ATTEMPTS; attempt++) {
+      attempts = attempt;
+      try {
+        const parsed = await this.callPlanner(system, JSON.stringify(requestPayload));
+        const plan = creativePlanSchema.parse(coercePlanShape(parsed));
+        const spec = assembleProductionSpec({
+          plan,
+          specParams: params,
+          contract,
+          meta: {
+            planner: "OllamaContentAIProvider",
+            plannerModel: this.model,
+            plannerLatencyMs: Date.now() - started,
+            plannerRetries: attempt - 1,
+            fallbackUsed: false,
+            contentProvenance: "MODEL_GENERATED",
+            contentConfidence: "high",
+          },
+        });
+        return spec;
+      } catch (error) {
+        lastError = error;
+        logger.warn(
+          { err: error instanceof Error ? error.message : String(error), model: this.model, attempt },
+          "Ollama creative plan attempt failed",
+        );
+      }
+    }
+
+    // A configured-but-failed planner is an honest error, never a silent
+    // drop into canned content the UI would label "AI Creative Director".
+    const reason = lastError instanceof Error ? lastError.message : String(lastError);
+    const isNet = /timeout|ECONN|ENOTFOUND|EAI_AGAIN|socket|refused|aborted/i.test(reason);
+    throw new ContentPlannerError(
+      isNet ? "planner_unavailable" : "planner_invalid_response",
+      `Local AI planner (${this.model}) failed after ${attempts} attempts: ${reason}`,
+    );
+  }
+
+  /**
+   * "Improve description" asks the real model for a concise creative brief -
+   * not a meta-prompt full of production instructions. The rewrite is
+   * rejected if it introduces facts the user's original did not contain.
+   */
   public async rewritePrompt(
     prompt: string,
     context?: { language?: any; dialect?: any; contentStyle?: any },
   ): Promise<PromptRewriteResult> {
-    return this.fallback.rewritePrompt(prompt, context);
+    if (!this.isConfigured) {
+      return this.fallback.rewritePrompt(prompt, context);
+    }
+    const isAr =
+      context?.language === "ar" ||
+      (context?.language !== "en" && /[\u0600-\u06FF]/.test(prompt));
+    const system = [
+      "You rewrite rough video ideas into a clear, concise creative brief a director could shoot from.",
+      "Return ONLY JSON: {\"improvedPrompt\": \"...\", \"keyPoints\": [\"...\"]}",
+      `Write in ${isAr ? "the same Arabic dialect as the input" : "English"}.`,
+      "Preserve: every explicit fact, quoted phrase, negative constraint, language/dialect, duration, CTA and product name.",
+      "Never add prices, discounts, contact details, WhatsApp, websites, testimonials, statistics, guarantees or promotions the user did not write.",
+      "Keep it human-editable: 2-6 short lines covering subject, audience, tone, key message and CTA if requested.",
+    ].join("\n");
+    try {
+      const parsed = (await this.callPlanner(system, JSON.stringify({ brief: prompt }))) as Record<
+        string,
+        unknown
+      >;
+      const improved = typeof parsed?.improvedPrompt === "string" ? parsed.improvedPrompt.trim() : "";
+      const keyPoints = Array.isArray(parsed?.keyPoints)
+        ? (parsed.keyPoints as unknown[]).filter((k): k is string => typeof k === "string" && k.trim().length > 0)
+        : [];
+      if (!improved || improved.length < 10) {
+        throw new Error("Local LLM returned an empty rewrite.");
+      }
+      // Models sometimes put the actual brief improvements in keyPoints and
+      // echo the original back in improvedPrompt - merge them rather than
+      // return a rewrite identical to the input.
+      const effective = improved === prompt.trim() && keyPoints.length > 0
+        ? `${improved} ${keyPoints.join(". ")}`
+        : improved;
+      if (inventsUngroundedClaim(effective, prompt)) {
+        // The rewrite added facts the user never stated - refuse it rather
+        // than ship invented claims back into the brief.
+        return {
+          originalPrompt: prompt,
+          enhancedPrompt: prompt,
+          changesSummary: "AI rewrite declined: it introduced facts not present in the original prompt.",
+        };
+      }
+      return {
+        originalPrompt: prompt,
+        enhancedPrompt: effective,
+        changesSummary:
+          keyPoints.length > 0
+            ? `AI-improved brief: ${keyPoints.slice(0, 4).join(" • ")}`
+            : "AI-improved creative brief.",
+      };
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      logger.warn({ err: reason, model: this.model }, "Ollama prompt rewrite failed");
+      throw new ContentPlannerError("planner_unavailable", `Local AI prompt rewrite failed: ${reason}`);
+    }
   }
 
+  /** Spec review is a validation task - the deterministic checker is the
+   *  correct engine for it; no model call needed. */
   public async reviewSpec(spec: ProductionSpec): Promise<SpecReviewResult> {
     return this.fallback.reviewSpec(spec);
   }

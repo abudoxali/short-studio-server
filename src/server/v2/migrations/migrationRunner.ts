@@ -627,6 +627,24 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: "2.14.0",
+    name: "v2_3_remove_rogue_job_triggers",
+    up: async (pool: Pool) => {
+      // Two triggers existed on some live databases that never shipped in
+      // source: trg_cleanup_failed_jobs silently DELETEd every failed/canceled
+      // job older than 5 minutes on any jobs write (destroying the audit
+      // trail, job_events history, and the failed-record lineage retryJob
+      // relies on), and trg_convert_needs_review bypassed the human-review
+      // gate by rewriting needs_review to ready on insert/update. Neither
+      // behaviour is part of the product contract - remove them wherever
+      // they were applied out-of-band.
+      await pool.query(`
+        DROP TRIGGER IF EXISTS trg_cleanup_failed_jobs ON jobs;
+        DROP TRIGGER IF EXISTS trg_convert_needs_review ON jobs;
+      `);
+    },
+  },
 ];
 
 /**

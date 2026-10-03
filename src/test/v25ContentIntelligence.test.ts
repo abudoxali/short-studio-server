@@ -1,25 +1,21 @@
 import { describe, expect, it } from "vitest";
 
-import { matchFactPack } from "../server/v2/content-ai/factPacks";
 import { detectContentStyle } from "../server/v2/content-ai/contentStyleDetector";
 import { LocalContentAIProvider } from "../server/v2/content-ai/localProvider";
 import { mediaIntelligenceService } from "../server/v2/media-intelligence/mediaIntelligenceService";
 
 /**
- * V2.4 PASS 5 - CONTENT INTELLIGENCE
- * -------------------------------------
- * Real Pass 4 benchmark 2 ("why airplane windows are rounded") produced
- * visually valid but topic-neutral narration
- * ("Here's something interesting...") because (a) `/api/v2/production/jobs`
- * has no `contentStyle` field a prompt-only customer can set, so every
- * prompt defaulted to "advertisement", and (b) even a curiosity-style
- * request had no source of actual topic knowledge to draw on. This suite
- * covers both fixes plus the deliberately-not-hardcoded generalization
- * requirement (section 41): a second, different topic must resolve through
- * the SAME matching mechanism, not a bespoke branch.
+ * CONTENT INTELLIGENCE - GENERALIZATION
+ * --------------------------------------
+ * Post-recovery the engine no longer ships hard-coded fact packs or a
+ * TOPIC_REGISTRY of benchmark scripts. The deterministic Basic planner is
+ * honest by construction: topic-anchored narration, BASIC_FALLBACK
+ * provenance, low confidence, and never a verbatim copy of the brief. The
+ * style detector still routes curiosity/explainer prompts correctly, and
+ * the media planner still receives real scene specs.
  */
 
-describe("V2.4 Pass 5: content style auto-detection", () => {
+describe("Content style auto-detection", () => {
   it("detects a curiosity prompt with no explicit contentStyle field available", () => {
     expect(
       detectContentStyle(
@@ -37,39 +33,8 @@ describe("V2.4 Pass 5: content style auto-detection", () => {
   });
 });
 
-describe("V2.4 Pass 5: fact pack matching generalizes beyond the airplane example", () => {
-  it("matches the airplane-windows pack from the exact Pass 4 benchmark prompt", () => {
-    const match = matchFactPack(
-      "Create a 25-second vertical curiosity video explaining why airplane windows are rounded instead of square.",
-      false,
-    );
-    expect(match?.pack.id).toBe("airplane_windows_rounded");
-  });
-
-  it("matches a genuinely different, unrelated topic through the same mechanism (not a second hardcoded branch)", () => {
-    const match = matchFactPack(
-      "Why do phone batteries charge much slower after about 80%?",
-      false,
-    );
-    expect(match?.pack.id).toBe("phone_battery_slow_after_80");
-  });
-
-  it("matches on a reasonable paraphrase, not just the exact benchmark wording", () => {
-    const match = matchFactPack("why do plane windows have rounded corners instead of square ones", false);
-    expect(match?.pack.id).toBe("airplane_windows_rounded");
-  });
-
-  it("returns null for a topic with no curated pack, rather than guessing", () => {
-    expect(matchFactPack("why do cats purr when they are happy", false)).toBeNull();
-  });
-
-  it("does not match when the topic is mentioned only to be excluded", () => {
-    expect(matchFactPack("this video is not about why airplane windows are round", false)).toBeNull();
-  });
-});
-
-describe("V2.4 Pass 5: LocalContentAIProvider produces real explanatory narration for curiosity prompts", () => {
-  it("actually explains the airplane-window physics instead of generic filler (hard content gate)", async () => {
+describe("Basic planner honesty on arbitrary topics", () => {
+  it("anchors narration to the topic and marks BASIC_FALLBACK provenance (curiosity prompt)", async () => {
     const provider = new LocalContentAIProvider();
     const spec = await provider.generateProductionSpec({
       prompt: "Create a 25-second vertical curiosity video explaining why airplane windows are rounded instead of square. Use highly relevant real footage, fast clean editing, natural narration and clean captions.",
@@ -78,21 +43,20 @@ describe("V2.4 Pass 5: LocalContentAIProvider produces real explanatory narratio
     });
 
     const allNarration = spec.scenes.map((s) => s.narration).join(" ").toLowerCase();
-    // The hard content gate: it must actually explain the concept, not just
-    // sound topical. "stress" + "round"/"corner" together is the real
-    // physics claim, not a synonym for "here's something interesting".
-    expect(allNarration).toMatch(/stress/);
-    expect(allNarration).toMatch(/round|curv/);
-    expect(allNarration).toMatch(/corner/);
-    expect(allNarration).not.toContain("here's something worth seeing");
-    expect(allNarration).not.toContain("here is what makes it worth your attention");
+    // The brief's meta wording must never be spoken.
+    expect(allNarration).not.toContain("curiosity video");
+    expect(allNarration).not.toContain("create a");
+    expect(allNarration).not.toContain("real footage");
+    // And the topic itself must be materially present (topic-concept
+    // anchoring), so the script is about airplanes/windows, not filler.
+    expect(allNarration).toMatch(/airplane|window/);
 
-    expect((spec.metadata as any)?.contentProvenance).toBe("DETERMINISTIC");
-    expect((spec.metadata as any)?.factPackId).toBe("airplane_windows_rounded");
-    expect((spec.metadata as any)?.contentConfidence).toBe("high");
+    expect((spec.metadata as any)?.contentProvenance).toBe("BASIC_FALLBACK");
+    expect((spec.metadata as any)?.contentConfidence).toBe("low");
+    expect((spec.metadata as any)?.basicMode).toBe(true);
   });
 
-  it("actually explains the second, unrelated topic too, proving this generalizes", async () => {
+  it("handles an unrelated topic through the same generic mechanism", async () => {
     const provider = new LocalContentAIProvider();
     const spec = await provider.generateProductionSpec({
       prompt: "Why do phone batteries charge much slower after about 80%? Make it a 20-second explainer with real footage.",
@@ -101,57 +65,26 @@ describe("V2.4 Pass 5: LocalContentAIProvider produces real explanatory narratio
     });
 
     const allNarration = spec.scenes.map((s) => s.narration).join(" ").toLowerCase();
-    expect(allNarration).toMatch(/lithium/);
-    expect(allNarration).toMatch(/trickle|slow/);
-    expect((spec.metadata as any)?.contentProvenance).toBe("DETERMINISTIC");
-    expect((spec.metadata as any)?.factPackId).toBe("phone_battery_slow_after_80");
+    expect(allNarration).not.toContain("make it a 20-second");
+    expect((spec.metadata as any)?.contentProvenance).toBe("BASIC_FALLBACK");
   });
 
-  it("honestly marks low confidence instead of pretending generic filler is professional for an uncovered topic", async () => {
-    const provider = new LocalContentAIProvider();
-    const spec = await provider.generateProductionSpec({
-      prompt: "Create a 20-second curiosity video explaining why cats purr when they are happy.",
-      language: "en",
-      requestedDurationSeconds: 20,
-    });
-
-    expect((spec.metadata as any)?.contentProvenance).toBe("SAFE_GENERIC");
-    expect((spec.metadata as any)?.contentConfidence).toBe("low");
-    // The generic fallback must still never splice raw prompt text in.
-    const allNarration = spec.scenes.map((s) => s.narration).join(" ").toLowerCase();
-    expect(allNarration).not.toContain("curiosity video");
-    expect(allNarration).not.toContain("cats purr");
-  });
-
-  it("still routes a genuine business prompt to its business template even with curiosity-shaped phrasing", async () => {
+  it("keeps a business prompt channel-safe and topic-anchored", async () => {
     const provider = new LocalContentAIProvider();
     const spec = await provider.generateProductionSpec({
       prompt: "Create a video explaining why our web design service is the best choice for small businesses.",
       language: "en",
       requestedDurationSeconds: 20,
     });
-    // Business-vertical dispatch (web design) must win over any accidental
-    // fact-pack match for this content-style-detected-as-curiosity prompt.
-    expect((spec.metadata as any)?.contentProvenance).toBe("DETERMINISTIC");
-    expect((spec.metadata as any)?.factPackId).toBeUndefined();
+    expect((spec.metadata as any)?.contentProvenance).toBe("BASIC_FALLBACK");
+    const combined = spec.scenes.map((s) => s.narration).join(" ").toLowerCase() + " " + (spec.cta?.text || "").toLowerCase();
+    expect(combined).not.toContain("whatsapp");
+    expect(combined).toMatch(/web|design|business/);
   });
 });
 
-describe("V2.4 Pass 5: fact-pack productions can legitimately take the multi-segment media-plan path", () => {
-  it("confirms sceneMediaPlan.segments.length > 1 is reachable for curiosity content (pins the precondition of a real coverage-reporting bug)", async () => {
-    // Live benchmark cmteyemae000p07n19o5egdlw (this exact prompt) rendered
-    // real airplane/cabin footage throughout (independently verified against
-    // the downloaded MP4) but reported realVisualCoveragePercent: 0% and
-    // professionalReady: false. Root cause: ShortCreator's OTHER, older
-    // multi-shot mechanism (triggered whenever a scene's media plan produces
-    // more than one segment - this is genuinely common for "fast"-paced
-    // content, confirmed here) never recorded anything into `plannedShots`,
-    // the sole source of truth `professionalVisualQuality` reads from - see
-    // the fix and full explanation at the `plannedShots.push` call inside
-    // ShortCreator.ts's sceneMediaPlan.segments branch. This test pins the
-    // precondition (segments.length > 1 really happens); the fix itself is
-    // exercised by ShortCreator's live render pipeline, not unit-testable in
-    // isolation without a very heavy integration harness.
+describe("Media planning still receives real scene specs", () => {
+  it("produces a media plan from a basic-mode spec", async () => {
     const provider = new LocalContentAIProvider();
     const spec = await provider.generateProductionSpec({
       prompt: "Create a 25-second vertical curiosity video explaining why airplane windows are rounded instead of square.",
@@ -159,7 +92,7 @@ describe("V2.4 Pass 5: fact-pack productions can legitimately take the multi-seg
       requestedDurationSeconds: 25,
     });
     const mediaPlan = mediaIntelligenceService.generateMediaPlan(spec);
-    const multiSegmentScene = mediaPlan.scenes.find((scene) => (scene.segments?.length || 0) > 1);
-    expect(multiSegmentScene, "at least one scene of a real curiosity production plans multiple segments").toBeDefined();
+    expect(mediaPlan.scenes.length).toBeGreaterThan(0);
+    expect(mediaPlan.scenes.every((s) => (s.segments?.length || 0) > 0)).toBe(true);
   });
 });

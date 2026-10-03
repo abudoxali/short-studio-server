@@ -30,10 +30,23 @@ export type ProfessionalVisualQualityReport = {
   stockTimelinePercent: number;
   uploadedTimelinePercent: number;
   motionOverlayPercent: number;
+  /**
+   * Motion seconds with a real creative reason attached (a planned graphic
+   * treatment or a recorded stock-rejection fallback). Professional quality
+   * means relevant visuals, not a mandatory percentage of stock footage -
+   * a designed explainer card honestly beats a random laptop clip.
+   */
+  purposefulMotionTimelinePercent: number;
+  /** Motion seconds with no recorded creative reason (suspicious). */
+  unexplainedMotionTimelinePercent: number;
+  /** realSeconds + purposeful motion: the share of the timeline carrying a deliberate visual. */
+  intentionalVisualCoveragePercent: number;
   rawPromptLeakCount: number;
   inventedClaimRiskCount: number;
   readyForProfessionalAuto: boolean;
   issues: string[];
+  /** Non-blocking advisories - recorded facts, not gate failures. */
+  notes: string[];
 };
 
 function norm(text: unknown): string {
@@ -90,6 +103,16 @@ export function calculateProfessionalVisualQualityReport(input: {
   const motionSeconds = secondsByType.motion || 0;
   const realSeconds = stockSeconds + generatedSeconds + uploadedSeconds;
 
+  // Motion shots with a recorded creative reason (creative_plan treatment or
+  // a stock-rejection fallback) are deliberate design; motion shots with no
+  // routing reason are unexplained fill. This is what separates "purposeful
+  // motion graphics" from "text over a colour because footage was missing".
+  const purposefulMotionSeconds = shots
+    .filter((shot) => shot.sourceType === "motion")
+    .filter((shot) => /creative_plan:|stock_rejected|motion_graphics|graphic/.test(String(shot.routingReason || "")))
+    .reduce((acc, shot) => acc + Math.max(0, shot.duration || 0), 0);
+  const unexplainedMotionSeconds = Math.max(0, motionSeconds - purposefulMotionSeconds);
+
   const providerMix: Record<string, number> = {};
   selected.forEach((asset) => {
     const provider = String(asset.provider || "unknown");
@@ -140,21 +163,38 @@ export function calculateProfessionalVisualQualityReport(input: {
     minimumSemanticScore: reportedScores.length ? Math.min(...reportedScores) : undefined,
     visualRelevanceMethod,
     blackFramePercent: input.blackFramePercent,
-    textOnlyTimelinePercent: Math.round((motionSeconds / total) * 1000) / 10,
+    textOnlyTimelinePercent: Math.round((unexplainedMotionSeconds / total) * 1000) / 10,
     generatedTimelinePercent: Math.round((generatedSeconds / total) * 1000) / 10,
     stockTimelinePercent: Math.round((stockSeconds / total) * 1000) / 10,
     uploadedTimelinePercent: Math.round((uploadedSeconds / total) * 1000) / 10,
     motionOverlayPercent: Math.round((motionSeconds / total) * 1000) / 10,
+    purposefulMotionTimelinePercent: Math.round((purposefulMotionSeconds / total) * 1000) / 10,
+    unexplainedMotionTimelinePercent: Math.round((unexplainedMotionSeconds / total) * 1000) / 10,
+    intentionalVisualCoveragePercent:
+      Math.round(((realSeconds + purposefulMotionSeconds) / total) * 1000) / 10,
     rawPromptLeakCount,
     inventedClaimRiskCount,
     readyForProfessionalAuto: false,
     issues: [],
+    notes: [],
   };
 
-  if (report.realVisualCoveragePercent < 90 && input.spec.visualMode !== "motion_graphics" && input.spec.visualMode !== "animated_explainer") {
+  const graphicsLed =
+    input.spec.visualMode === "motion_graphics" ||
+    input.spec.visualMode === "animated_explainer" ||
+    input.spec.productionMode === "motion_graphics" ||
+    input.spec.productionMode === "animated_explainer";
+
+  // Coverage is judged on intentional visuals: real footage plus graphics the
+  // pipeline chose on purpose. A production that resolved weak-stock scenes
+  // to designed motion is honest; one that left unexplained gaps is not.
+  if (report.intentionalVisualCoveragePercent < 90 && !graphicsLed) {
     report.issues.push("real_visual_coverage_below_90_percent");
   }
-  if (report.textOnlyTimelinePercent > 10 && input.spec.visualMode !== "motion_graphics" && input.spec.visualMode !== "animated_explainer") {
+  if (report.purposefulMotionTimelinePercent > 0 && report.stockTimelinePercent < 90 && !graphicsLed) {
+    report.notes.push("some_scenes_resolved_to_purposeful_motion_graphics");
+  }
+  if (report.textOnlyTimelinePercent > 10 && !graphicsLed) {
     report.issues.push("text_only_timeline_above_10_percent");
   }
   if (report.repeatedAssetCount > 0) report.issues.push("repeated_visual_assets_detected");

@@ -15,7 +15,7 @@ describe("Milestone V2.3-03: Component Integration (Timeline Audio Mastering & M
   afterAll(() => {
     try {
       fs.removeSync(tmpDir);
-    } catch {}
+    } catch { }
   });
 
   it("verifies continuous narration timeline, mastered audio, and bounded breathing pauses (< 300ms)", async () => {
@@ -134,5 +134,5 @@ describe("Milestone V2.3-03: Component Integration (Timeline Audio Mastering & M
     expect(composed.composed).toBe(true);
     expect(fs.existsSync(outputPath)).toBe(true);
     expect(fs.statSync(outputPath).size).toBeGreaterThan(5000);
-  });
+  }, 120000);
 });

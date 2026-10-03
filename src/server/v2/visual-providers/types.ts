@@ -24,6 +24,13 @@ export type VisualRenderOptions = {
   targetDurationSeconds?: number;
   previousCandidates?: Record<string, unknown>[];
   /**
+   * Deliberately broad fallback queries emitted by the query-family engine
+   * (e.g. "technology", "office") when no concrete concept was recognised. A
+   * candidate that only surfaced through one of these is unproven: the router
+   * accepts it only when its own metadata also overlaps the scene intent.
+   */
+  genericStockTerms?: string[];
+  /**
    * Fine-grained wall-clock accounting (V2.4 Pass 5, section 12). Optional
    * and additive only - omitting it changes no behavior. Callers accumulate
    * these into a per-production report (`providerSearchMs`,

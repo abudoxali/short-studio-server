@@ -21,6 +21,7 @@ import { AuthService } from "./v2/auth/authService";
 import { ApiTokenService } from "./v2/auth/apiTokenService";
 import { cleanupTemporaryArtifacts } from "./v2/storage/storagePolicy";
 import { resolveTrustedProxy } from "./v2/system/trustedProxy";
+import { WorkerLeaseService } from "./v2/workers/workerLeaseService";
 
 export class Server {
   private app: express.Application;
@@ -116,6 +117,7 @@ export class Server {
           logger.warn({ err }, "Stale job recovery encountered non-fatal error");
         });
         this.scheduleQueuedJobSweep(v2Database);
+        this.scheduleJobWatchdog(v2Database);
         cleanupTemporaryArtifacts(config)
           .then((result) => {
             if (result.deleted > 0) {
@@ -209,6 +211,113 @@ export class Server {
         }
       })().catch((err) => logger.warn({ err }, "Queued-job restart sweep failed"));
     }, 15000);
+    timer.unref?.();
+  }
+
+  /**
+   * Recurring stranded-job watchdog. The boot-time sweep only covers the
+   * restart case; a worker that loses contact while the app keeps running
+   * leaves jobs frozen mid-stage forever. Every 60s this:
+   *   1. re-queues jobs whose worker lease expired,
+   *   2. re-queues mid-stage jobs with no progress update for 10 minutes and
+   *      no live claimant (bounded to 2 automatic re-queues, recorded in
+   *      job_events so an operator can see the lineage),
+   *   3. fails jobs that exhausted their re-queues with an honest technical
+   *      code instead of leaving them "working" forever,
+   *   4. re-dispatches queued jobs when the render worker is healthy.
+   */
+  private scheduleJobWatchdog(v2Database: V2Database): void {
+    const config = this.config;
+    const STUCK_AFTER_MS = 10 * 60 * 1000;
+    const MAX_AUTO_REQUEUES = 2;
+    let ticking = false;
+    const timer = setInterval(() => {
+      if (ticking) return;
+      ticking = true;
+      void (async () => {
+        await new WorkerLeaseService(v2Database).recoverExpiredLeases();
+
+        const stranded = await v2Database.query<{ id: string }>(
+          `UPDATE jobs
+           SET status = 'queued',
+               current_stage = 'Re-queued after worker silence',
+               updated_at = now()
+           WHERE status IN ('preparing','generating_content','searching_assets','generating_voice','generating_captions','rendering','finalizing')
+             AND updated_at < now() - $1::interval
+             AND NOT EXISTS (
+               SELECT 1 FROM worker_leases w
+               WHERE w.active_job_id = jobs.id AND w.lease_expires_at > now()
+             )
+             AND (
+               SELECT count(*) FROM job_events e
+               WHERE e.job_id = jobs.id AND e.technical_message = 'WATCHDOG_AUTO_REQUEUED'
+             ) < $2
+           RETURNING id`,
+          [`${STUCK_AFTER_MS} milliseconds`, MAX_AUTO_REQUEUES],
+        );
+        for (const row of stranded) {
+          await v2Database.query(
+            `INSERT INTO job_events (job_id, status, progress, stage, message, technical_message)
+             SELECT id, 'queued', progress, 'Re-queued', 'Re-queued automatically after the render worker stopped reporting progress.', 'WATCHDOG_AUTO_REQUEUED'
+             FROM jobs WHERE id = $1`,
+            [row.id],
+          ).catch(() => undefined);
+        }
+
+        const exhausted = await v2Database.query<{ id: string }>(
+          `UPDATE jobs
+           SET status = 'failed',
+               error = 'Production stalled repeatedly and could not be recovered automatically. Please retry.',
+               technical_error = 'STALE_JOB_NO_PROGRESS',
+               updated_at = now()
+           WHERE status IN ('preparing','generating_content','searching_assets','generating_voice','generating_captions','rendering','finalizing')
+             AND updated_at < now() - $1::interval
+             AND NOT EXISTS (
+               SELECT 1 FROM worker_leases w
+               WHERE w.active_job_id = jobs.id AND w.lease_expires_at > now()
+             )
+             AND (
+               SELECT count(*) FROM job_events e
+               WHERE e.job_id = jobs.id AND e.technical_message = 'WATCHDOG_AUTO_REQUEUED'
+             ) >= $2
+           RETURNING id`,
+          [`${STUCK_AFTER_MS} milliseconds`, MAX_AUTO_REQUEUES],
+        );
+        if (stranded.length || exhausted.length) {
+          logger.info(
+            { requeued: stranded.map((r) => r.id), failed: exhausted.map((r) => r.id) },
+            "Job watchdog recovered stranded jobs",
+          );
+        }
+
+        try {
+          await axios.get(`${config.renderWorkerBaseUrl}/health`, { timeout: 5000 });
+        } catch {
+          return;
+        }
+        const queued = await v2Database.query<{ id: string }>(
+          "SELECT id FROM jobs WHERE status = 'queued' ORDER BY created_at ASC LIMIT 10",
+        );
+        for (const row of queued) {
+          await axios
+            .post(
+              `${config.appInternalBaseUrl}/internal/v1/jobs/${row.id}/start`,
+              {},
+              {
+                timeout: config.webhookTimeoutMs,
+                headers: { "x-internal-token": config.internalServiceToken },
+              },
+            )
+            .catch((err) =>
+              logger.warn({ err, jobId: row.id }, "Watchdog queued-job dispatch failed"),
+            );
+        }
+      })()
+        .catch((err) => logger.warn({ err }, "Job watchdog tick failed"))
+        .finally(() => {
+          ticking = false;
+        });
+    }, 60000);
     timer.unref?.();
   }
 

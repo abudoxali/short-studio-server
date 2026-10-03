@@ -22,7 +22,7 @@ describe("Content AI Providers & Creative Director", () => {
     expect(spec.cta?.contact).toBe("WhatsApp");
   });
 
-  it("Local AI preserves English technical educational prompts", async () => {
+  it("Local AI (Basic mode) produces topic-anchored English scenes without canned vertical content", async () => {
     const provider = new LocalContentAIProvider();
     const spec = await provider.generateProductionSpec({
       prompt: "Create a 30-second educational short explaining why backups matter for small businesses",
@@ -30,12 +30,17 @@ describe("Content AI Providers & Creative Director", () => {
     });
 
     expect(spec.language).toBe("en");
-    expect(spec.scenes.length).toBe(4);
-    expect(spec.scenes[0].narration).toContain("data");
-    expect(spec.scenes[0].stockSearchTerms).toContain("server room blinking");
+    expect(spec.scenes.length).toBe(3);
+    // Topic-anchored: the generated line references the customer's subject
+    // ("backup"/"business"), never canned pack copy or the raw prompt.
+    const narration = spec.scenes.map((s) => s.narration).join(" ").toLowerCase();
+    expect(narration).toMatch(/backup|business/);
+    expect(narration).not.toContain("explaining why backups matter");
+    expect(spec.scenes[0].stockSearchTerms.length).toBeGreaterThan(0);
+    expect((spec.metadata as any)?.contentProvenance).toBe("BASIC_FALLBACK");
   });
 
-  it("Local AI creates topic-specific English coffee subscription scenes", async () => {
+  it("Local AI (Basic mode) anchors an English coffee prompt to the topic", async () => {
     const provider = new LocalContentAIProvider();
     const spec = await provider.generateProductionSpec({
       prompt: "Create a 20-second vertical Short for a modern coffee subscription with real cafe preparation footage",
@@ -45,12 +50,12 @@ describe("Content AI Providers & Creative Director", () => {
 
     expect(spec.language).toBe("en");
     expect(spec.scenes).toHaveLength(3);
-    expect(spec.scenes[0].stockSearchTerms.join(" ")).toContain("coffee");
-    expect(spec.scenes[1].stockSearchTerms.join(" ")).toContain("coffee");
-    expect(spec.scenes[0].onScreenText).toBe("Cafe Quality At Home");
+    expect(spec.scenes[0].stockSearchTerms.join(" ").toLowerCase()).toContain("coffee");
+    expect(spec.scenes[0].onScreenText?.toLowerCase()).toContain("coffee");
+    expect((spec.metadata as any)?.contentProvenance).toBe("BASIC_FALLBACK");
   });
 
-  it("Local AI creates topic-specific English boutique fitness scenes", async () => {
+  it("Local AI (Basic mode) anchors an English fitness prompt to the topic", async () => {
     const provider = new LocalContentAIProvider();
     const spec = await provider.generateProductionSpec({
       prompt: "Create a 20-second vertical Short for a boutique fitness studio with real people training",
@@ -60,9 +65,9 @@ describe("Content AI Providers & Creative Director", () => {
 
     expect(spec.language).toBe("en");
     expect(spec.scenes).toHaveLength(3);
-    expect(spec.scenes[0].stockSearchTerms.join(" ")).toContain("fitness");
-    expect(spec.scenes[1].stockSearchTerms.join(" ")).toContain("trainer");
-    expect(spec.scenes[0].onScreenText).toBe("Train With Purpose");
+    // Topic concepts are lightly stemmed ("fitness" -> "fitnes").
+    expect(spec.scenes[0].stockSearchTerms.join(" ").toLowerCase()).toContain("fitnes");
+    expect(spec.scenes[0].onScreenText?.toLowerCase()).toContain("fitnes");
   });
 
   it("Local AI enhances prompts with structured guidance without replacing original", async () => {

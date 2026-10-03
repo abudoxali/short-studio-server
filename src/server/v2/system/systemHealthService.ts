@@ -9,7 +9,7 @@ export class SystemHealthService {
   constructor(
     private db: V2Database,
     private config: Config,
-  ) {}
+  ) { }
 
   public getProductDetails() {
     return getProductInfo();
@@ -82,7 +82,7 @@ export class SystemHealthService {
              error = 'Job interrupted by container restart.',
              technical_error = 'STALE_PROCESS_INTERRUPTED_ON_STARTUP',
              updated_at = now()
-         WHERE status IN ('rendering', 'processing')
+         WHERE status IN ('preparing','generating_content','searching_assets','generating_voice','generating_captions','rendering','finalizing')
          RETURNING id`,
       );
       recoveredJobsCount += staleJobs.length;

@@ -18,7 +18,7 @@ export const PRODUCT_BUILD = "2026.09.12.1";
  * migration runner fails the build if the two drift apart: a stale constant here
  * makes the updater report a schema it never actually applied.
  */
-export const DATABASE_SCHEMA_VERSION = "2.13.0";
+export const DATABASE_SCHEMA_VERSION = "2.14.0";
 
 /** Release channels a client installation may follow. Clients default to stable. */
 export type ReleaseChannel = "stable" | "development";

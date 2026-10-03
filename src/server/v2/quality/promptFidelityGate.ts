@@ -146,7 +146,7 @@ export function verifyPromptFidelity(
 
     // 6. Check for raw prompt/meta-instruction leakage in narration
     const isAr = contract.language === "ar";
-    const stripped = stripMetaInstructions(scene.narration, isAr);
+    const stripped = stripMetaInstructions(scene.narration, isAr, { forNarration: true });
     if (stripped !== scene.narration && stripped.length < scene.narration.length) {
       issues.push({
         rule: "raw_prompt_leak",
@@ -203,7 +203,7 @@ export function enforceAndRepairPromptFidelity(
     const isAr = contract.language === "ar";
 
     // Strip raw prompt/meta-instruction leakage from narration
-    const metaStripped = stripMetaInstructions(narration, isAr);
+    const metaStripped = stripMetaInstructions(narration, isAr, { forNarration: true });
     if (metaStripped !== narration && metaStripped.length > 0) {
       narration = metaStripped;
       repaired = true;

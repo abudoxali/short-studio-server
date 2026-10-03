@@ -19,19 +19,14 @@ import {
   stripInventedClaims,
   type ResolvedCta,
 } from "../creative/ctaPolicy";
-import { matchFactPack, type FactPackEntry } from "./factPacks";
 import { detectContentStyle } from "./contentStyleDetector";
 import { extractTopicConcepts } from "./scriptQuality";
-import { estimateSpeechSeconds, getSpeakingRate, type SpeakingRateProfile } from "./voiceSpeakingRate";
+import { estimateSpeechSeconds, getSpeakingRate } from "./voiceSpeakingRate";
 import {
-  allocateBeatDurations,
   buildContentDurationBudget,
   checkContentDurationFeasibility,
-  composeNarrationForDuration,
-  type NarrationUnit,
 } from "./scriptDurationController";
 import { buildPromptIntentContract, stripMetaInstructions } from "./promptIntentContract";
-import { compileGroundedScenes } from "./topicGroundingCompiler";
 import { enforceAndRepairPromptFidelity } from "../quality/promptFidelityGate";
 
 function isArabic(text: string): boolean {
@@ -140,7 +135,7 @@ function enforcePromptTruthSafety(
     const safeNarration = stripInventedClaims(scene.narration, prompt, isAr);
     // Also strip any residual meta/orchestration instructions from narration
     // (e.g. "Create a 15 second short about..." that survived earlier cleaning)
-    const metaStrippedNarration = stripMetaInstructions(safeNarration || scene.narration, isAr);
+    const metaStrippedNarration = stripMetaInstructions(safeNarration || scene.narration, isAr, { forNarration: true });
     const safeOnScreen =
       scene.onScreenText && !looksLikeRawInstruction(scene.onScreenText, prompt)
         ? stripInventedClaims(scene.onScreenText, prompt, isAr)
@@ -170,9 +165,19 @@ export function extractDurationFromPrompt(prompt: string): number | null {
   return null;
 }
 
+/**
+ * Deterministic "Basic" planner. It is the declared fallback engine - used
+ * only when the active creative model (Ollama) is not configured, or when the
+ * operator explicitly selects it. It writes honest, topic-anchored generic
+ * scenes; it does NOT impersonate model intelligence with hard-coded
+ * vertical scripts (the previous TOPIC_REGISTRY / fact-pack / vertical
+ * builder bodies were removed - the real planner supersedes them). Every
+ * spec it emits is marked contentProvenance BASIC_FALLBACK so degraded
+ * output is never silently presented as model-generated.
+ */
 export class LocalContentAIProvider implements ContentAIProvider {
   public readonly id = "local_ai";
-  public readonly displayName = "Local AI Creative Director";
+  public readonly displayName = "Basic Deterministic Planner";
   public readonly category = "content_ai" as const;
 
   public async generateProductionSpec(
@@ -206,19 +211,7 @@ export class LocalContentAIProvider implements ContentAIProvider {
     const voiceProvider = params.voiceProvider || "auto";
     const voiceId = params.voiceId || "";
 
-    // Content provenance (V2.4 Pass 5, section 5): DETERMINISTIC covers every
-    // hand-written template this planner can produce, including the
-    // business-vertical ad templates - they are real, curated content, just
-    // not curated for THIS specific customer's facts. SAFE_GENERIC marks the
-    // one case where this planner is honestly guessing: a curiosity/
-    // explainer prompt that matched no curated fact pack, where it has no
-    // basis to write a real explanation and falls back to topic-neutral
-    // copy (see buildGenericEnglishScenes). USER_FACT / BRAND_DATA /
-    // MODEL_GENERATED are reserved for providers that actually have those
-    // inputs (a configured brand profile, a live LLM) - see
-    // ollamaProvider.ts / geminiProvider.ts.
     const curiosityStyle = contentStyle === "viral_curiosity" || contentStyle === "educational" || contentStyle === "explainer";
-    const factPackMatch = !isAr && curiosityStyle ? matchFactPack(prompt, false) : null;
 
     const resolvedCta = resolveCtaProvenance({
       prompt,
@@ -228,28 +221,20 @@ export class LocalContentAIProvider implements ContentAIProvider {
       isCuriosityStyle: curiosityStyle,
     });
 
-    const scenes = enforcePromptTruthSafety(this.buildCreativeScenes({
+    const scenes = enforcePromptTruthSafety(this.buildBasicScenes({
       prompt,
       isArabic: isAr,
-      dialect,
       durationSeconds,
-      contentStyle,
+      ctaText: resolvedCta.text,
       brandName: params.brandName || params.brandKit?.brandName,
-      voiceProvider: params.voiceProvider,
-      voiceId: params.voiceId,
     }), prompt, isAr, dialect, resolvedCta);
 
-    // Pre-TTS fail-closed feasibility gate (Short Studio 2.5 Arabic content-
-    // planning closure, section 8): even after the planner has already
-    // chosen how many scenes to keep and how to size them, ask whether the
-    // resulting narration could plausibly ever land within its own scene's
-    // target - using the SAME real calibrated speaking rate and the SAME
-    // bounded natural speed-adjustment ceiling the post-TTS corrector is
-    // allowed to use - before spending a single real TTS call on content
-    // already known to be impossible (e.g. a request too short to hold
-    // even the minimal required message). The post-TTS `decideCorrectionAction`
-    // + total-duration authority gate in ShortCreator remain the final,
-    // real-audio authority; this is strictly an earlier, cheaper guard.
+    // Pre-TTS fail-closed feasibility gate: ask whether the resulting
+    // narration could plausibly ever land within its own scene's target -
+    // using the same calibrated speaking rate and the same bounded natural
+    // speed-adjustment ceiling the post-TTS corrector is allowed to use -
+    // before spending real TTS calls on content already known to be
+    // impossible.
     const planningRate = getSpeakingRate(params.voiceProvider || "", params.voiceId || "", isAr ? "ar" : "en");
     const sceneEstimates = scenes.map((s) => estimateSpeechSeconds(s.narration, planningRate));
     const durationBudget = buildContentDurationBudget({
@@ -270,7 +255,6 @@ export class LocalContentAIProvider implements ContentAIProvider {
     }
 
     const ctaText = resolvedCta.text;
-    const contentProvenance = factPackMatch ? "DETERMINISTIC" : curiosityStyle ? "SAFE_GENERIC" : "DETERMINISTIC";
 
     const rawSpec: ProductionSpec = {
       id: cuid(),
@@ -302,34 +286,18 @@ export class LocalContentAIProvider implements ContentAIProvider {
       brandKit: params.brandKit,
       metadata: {
         planner: "LocalContentAIProvider",
-        plannerVersion: "3.0.0",
+        plannerVersion: "4.0.0",
         durationBudget,
         promptCompiler: {
-          version: "prompt_compiler.v3",
+          version: "basic_planner.v1",
           rawPromptLeakGuard: true,
           truthGuard: true,
           ctaProvenance: resolvedCta.provenance,
           prohibitedInventedClaims: ["prices", "discounts", "phone_numbers", "whatsapp_cta", "statistics", "testimonials", "urls"],
         },
-        contentProvenance,
-        contentConfidence: contentProvenance === "SAFE_GENERIC" ? "low" : "high",
-        factPackId: factPackMatch?.pack.id,
-        scriptPipeline: isAr
-          ? {
-            stages: [
-              "draft",
-              "dialect_rewrite",
-              "spoken_language_normalization",
-              "duration_fit",
-              "hook_check",
-              "repetition_cleanup",
-              "cta_check",
-              "scene_segmentation",
-            ],
-            dialect,
-            subjectiveQualityScore: null,
-          }
-          : undefined,
+        contentProvenance: "BASIC_FALLBACK",
+        contentConfidence: "low",
+        basicMode: true,
       },
     };
 
@@ -354,6 +322,14 @@ export class LocalContentAIProvider implements ContentAIProvider {
     return qualityCheck.correctedSpec || validated;
   }
 
+  /**
+   * Basic-mode rewrite: a safe structural expansion only. It frames the
+   * user's own idea as a brief (subject + structure request) without adding
+   * any fact the user did not write - no invented offers, channels, or
+   * vertical-specific copy (the previous canned per-vertical rewrites were
+   * removed with the fake-complexity cleanup). The model-backed provider
+   * performs the real rewrite when Ollama is configured.
+   */
   public async rewritePrompt(
     prompt: string,
     context?: { language?: string; dialect?: ArabicDialect; contentStyle?: string },
@@ -361,42 +337,18 @@ export class LocalContentAIProvider implements ContentAIProvider {
     const trimmed = prompt.trim();
     const isAr = context?.language === "ar" || isArabic(trimmed);
     const dialect = context?.dialect || detectArabicDialect(trimmed);
+    const styleLabel = context?.contentStyle || "advertisement";
 
-    let enhanced = "";
-    let summary = "";
-
-    if (isAr) {
-      if (trimmed.includes("كافيه") || trimmed.includes("قهوة") || trimmed.includes("cafe")) {
-        enhanced =
-          "اعمل فيديو إعلان 20 ثانية رأسي باللهجة المصرية لكافيه عصري في القاهرة يستهدف الشباب. افتح بـ Hook حسي عن ريحة القهوة والروقان، واعرض لقطات قريبة لتحضير الإسبريسو وقعدة الكافيه المميزة، واختم بـ CTA للزيارة وعرض خاص.";
-        summary = "تمت إضافة تفاصيل المكان، الفئة المستهدفة، اللهجة المصرية، وبنية الـ Hook والعرض والـ CTA.";
-      } else if (trimmed.includes("ملابس") || trimmed.includes("براند") || trimmed.includes("تيشرت")) {
-        enhanced =
-          "اعمل إعلان 30 ثانية رأسي باللهجة المصرية لبراند ملابس شبابي وستريت وير. البداية Hook قوي عن الراحة والشياكة في الصيف، واستعرض جودة الخامة القطنية والقصة، واختم بـ CTA للطلب عبر واتساب مع خصم لفترة محدودة.";
-        summary = "تم تحسين التفاصيل البصرية وتركيز الـ Hook على خامة الملابس وتحديد دعوة واضحة للطلب على واتساب.";
-      } else if (trimmed.includes("مطعم") || trimmed.includes("برجر") || trimmed.includes("اكل")) {
-        enhanced =
-          "اعمل فيديو إعلان 15 ثانية لمطعم برجر سريع وحماسي باللهجة المصرية. ركز على الجبنة السايحة واللحمة على الجريل، اذكر عرض الوجبة المزدوجة، واختم بـ CTA للطلب دليفري دلوقتي.";
-        summary = "تمت إضافة وصف اللقطات السينمائية للأكل والعرض الحالي ورابط الدليفري.";
-      } else {
-        enhanced = `اعمل فيديو 30 ثانية رأسي باللهجة المصرية يركز على ${trimmed}. البداية Hook جذاب يشد الانتباه في أول 3 ثوانٍ، يتبعه شرح القيمة الأساسية مع لقطات ديناميكية، ثم إنهاء بـ CTA واضح للطلب والمتابعة.`;
-        summary = "تم تحويل الفكرة المختصرة إلى سكريبت متكامل يحدد المدة واللهجة والـ Hook والـ CTA.";
-      }
-    } else {
-      if (trimmed.toLowerCase().includes("backup") || trimmed.toLowerCase().includes("tech")) {
-        enhanced =
-          "Create a 30-second vertical English educational short explaining why automated backups protect small businesses from catastrophic data loss. Open with an urgent hook, show simple modern tech visuals, and end with an actionable CTA.";
-        summary = "Added audience context, vertical framing, visual style guidelines, and clear CTA.";
-      } else {
-        enhanced = `Create a high-energy 30-second vertical video about ${trimmed}. Open with an engaging 3-second hook, deliver 2 clear value points with crisp visuals, and end with a direct call-to-action to message or subscribe.`;
-        summary = "Expanded raw prompt with pacing, hook timing, visual guidance, and CTA structure.";
-      }
-    }
+    const enhanced = isAr
+      ? `اعمل فيديو ${styleLabel === "advertisement" ? "إعلاني" : "قصير"} رأسي عن: ${trimmed}. البداية Hook يشد الانتباه في أول 3 ثوانٍ، ثم رسالة واضحة واحدة، وإنهاء بدعوة مباشرة للتواصل أو المتابعة إن رغب العميل.`
+      : `Create a vertical ${styleLabel} short about: ${trimmed}. Open with a strong 3-second hook, deliver one clear key message, and close with a direct call-to-action only if the brief asks for one.`;
 
     return {
       originalPrompt: prompt,
       enhancedPrompt: enhanced,
-      changesSummary: summary,
+      changesSummary: isAr
+        ? `وضع أساسي (بدون نموذج ذكاء اصطناعي): إعادة صياغة بسيطة للفكرة باللهجة ${dialect === "none" ? "العربية" : "المصرية"} مع هيكل Hook/رسالة/CTA - لم تُضاف أي حقائق جديدة.`
+        : "Basic mode (no AI model): reframed the idea as a hook/message/CTA brief without adding any facts.",
     };
   }
 
@@ -413,11 +365,11 @@ export class LocalContentAIProvider implements ContentAIProvider {
 
   public async validate(): Promise<ProviderValidationResult> {
     return {
-      provider: "Local AI Creative Director",
+      provider: "Basic Deterministic Planner",
       configured: true,
       healthy: true,
       status: "healthy",
-      message: "Local deterministic Creative Director engine is operational.",
+      message: "Basic deterministic planner is operational (explicit fallback mode).",
       checkedAt: new Date().toISOString(),
       latencyMs: 1,
     };
@@ -431,195 +383,52 @@ export class LocalContentAIProvider implements ContentAIProvider {
     return `AI Production: ${words}`;
   }
 
-  private buildCreativeScenes(context: {
+  /**
+   * The entire Basic scene source: three topic-anchored beats built from the
+   * customer's own extracted topic concepts. Never quotes prompt sentences
+   * as narration, never invents a channel or claim - the truth-safety pass
+   * above still re-checks every field.
+   */
+  private buildBasicScenes(context: {
     prompt: string;
     isArabic: boolean;
-    dialect: ArabicDialect;
     durationSeconds: number;
-    contentStyle: string;
+    ctaText: string;
     brandName?: string;
-    voiceProvider?: string;
-    voiceId?: string;
   }): ProductionSceneSpec[] {
-    const { prompt, isArabic: isAr, dialect, durationSeconds, contentStyle, brandName, voiceProvider, voiceId } = context;
-    const lower = prompt.toLowerCase();
-    // Real, measured calibration when the exact voice is already known (see
-    // voiceSpeakingRate.ts); a language-level default otherwise. Used only by
-    // duration-aware content packs (currently: the backup/tech vertical) to
-    // size how much narration to write BEFORE TTS - the real synthesized
-    // audio duration remains the only authority for the final timeline.
-    const speakingRate = getSpeakingRate(voiceProvider || "", voiceId || "", isAr ? "ar" : "en");
-
-    // Outro budget deduction
+    const { prompt, isArabic: isAr, durationSeconds, ctaText } = context;
     const outroTime = Math.min(2.5, Math.max(1.5, Math.round(durationSeconds * 0.1 * 10) / 10));
     const contentBudget = Math.max(durationSeconds - outroTime, 6);
+    const dur = Math.round((contentBudget / 3) * 10) / 10;
 
-    // Curated fact packs answer a curiosity/explainer prompt for real
-    // instead of falling straight to the generic ad-flavored template - see
-    // factPacks.ts. English only for now (no Arabic explanation content
-    // written yet); an Arabic curiosity prompt still falls through to the
-    // existing Arabic dispatch below. Only consulted for curiosity-leaning
-    // content styles so a genuine business prompt ("why our web design
-    // service is the best") still gets the business-vertical template it
-    // needs, not a fact pack.
-    const curiosityStyle = contentStyle === "viral_curiosity" || contentStyle === "educational" || contentStyle === "explainer";
-    if (!isAr && curiosityStyle) {
-      const match = matchFactPack(prompt, false);
-      if (match) {
-        return this.buildFactPackScenes(match.pack, contentBudget);
-      }
-    }
-
-    // Scene count: 3 scenes for <=22s, 4 scenes for >22s
-    const sceneCount = durationSeconds <= 22 ? 3 : 4;
-    const durPerScene = Math.round((contentBudget / sceneCount) * 10) / 10;
-
-    // "back up"/"backing up" (two words, or with a gerund/past-tense suffix)
-    // is the natural phrasing customers actually type - a literal-only
-    // "backup" substring test missed this proof's own real request ("Why
-    // small businesses should back up their files") entirely and fell
-    // through to the generic template instead of the real backup content
-    // pack (ABUD_SHORTS_ENGINE_STATUS.md section 4).
-    const contract = buildPromptIntentContract(prompt, {
-      language: isAr ? "ar" : "en",
-      dialect,
-      durationSeconds,
-      contentStyle: contentStyle as any,
-    });
-
-    const isBackupTopicEn = /back(?:s|ing|ed)?[\s-]?up|\bfiles\b|data loss|cloud storage/i.test(lower);
-    const isBackupTopicAr = /نسخ|احتياطي|ملفات|فقدان البيانات/i.test(prompt);
-
-    const hasPromptSpecificInstructions =
-      contract.negativeConstraints.length > 0 ||
-      /\b(?:mention|focus on|explain|no prices|no discounts|without|do not|don't|not square|type hints|mypy|maintainability|three mistakes)\b/i.test(prompt) ||
-      /(?:بدون|لا تذكر|اشرح|ركز|ليه|لماذا|أخطاء|خصومات|أسعار|إحصائيات|بتبطأ)/i.test(prompt);
-    const uncoveredCuriosityVideo =
-      !isAr &&
-      !matchFactPack(prompt, false) &&
-      /\bcuriosity video\b/i.test(prompt);
-    const uncoveredFactualQuestion =
-      !isAr &&
-      !matchFactPack(prompt, false) &&
-      /^\s*why\s+(?:do|does|is|are|can|could|would|did)\b/i.test(prompt);
-    if (uncoveredCuriosityVideo || uncoveredFactualQuestion) {
-      return this.buildGenericEnglishScenes(prompt, durPerScene, brandName);
-    }
-
-    if (
-      hasPromptSpecificInstructions &&
-      !uncoveredCuriosityVideo &&
-      process.env.ABUD_ENABLE_LEGACY_TEMPLATE_PLANNER !== "true"
-    ) {
-      return compileGroundedScenes(contract, durationSeconds);
-    }
+    // Meta-words describing the REQUEST FORMAT ("curiosity video", "explaining",
+    // "vertical") are not topic concepts - filter them before anchoring the
+    // generic lines so the basic script is about the subject, not the ask.
+    const BASIC_META_WORDS = new Set([
+      "vertical", "horizontal", "portrait", "landscape", "curiosity", "explainer",
+      "educational", "education", "tutorial", "guide",
+      "explain", "explaining", "why", "how", "what", "short", "reel", "tiktok",
+      "ad", "commercial", "promo", "highly", "relevant", "natural", "clean",
+      "editing", "captions", "real", "footage", "broll", "fast", "engaging",
+      "شرح", "ليه", "ازاي", "كيف", "هل", "تعلم",
+    ]);
+    const topicConcepts = extractTopicConcepts(prompt, isAr ? "ar" : "en")
+      .filter((c) => !BASIC_META_WORDS.has(c))
+      .slice(0, 3);
+    const topicPhrase = topicConcepts.length > 0
+      ? topicConcepts.join(isAr ? " و" : " and ")
+      : isAr ? "احتياجاتك" : "your needs";
 
     if (isAr) {
-      if (lower.includes("موقع") || lower.includes("مواقع") || lower.includes("ويب") || lower.includes("web") || lower.includes("تصميم")) {
-        return this.buildWebDesignScenesArabic(dialect, durPerScene, brandName, durationSeconds);
-      }
-      if (lower.includes("كافيه") || lower.includes("قهوة") || lower.includes("cafe")) {
-        return this.buildCafeScenesArabic(dialect, durPerScene, brandName);
-      }
-      if (lower.includes("ملابس") || lower.includes("تيشرت") || lower.includes("ستريت") || lower.includes("clothing") || lower.includes("براند")) {
-        return this.buildClothingScenesArabic(dialect, durPerScene, brandName, durationSeconds);
-      }
-      if (lower.includes("مطعم") || lower.includes("برجر") || lower.includes("اكل") || lower.includes("وجبة")) {
-        return this.buildFoodScenesArabic(dialect, durPerScene, brandName);
-      }
-      if (lower.includes("عقار") || lower.includes("شقة") || lower.includes("فيلا") || lower.includes("كمبوند")) {
-        return this.buildRealEstateScenesArabic(dialect, durPerScene, brandName);
-      }
-      if (isBackupTopicAr) {
-        return this.buildTechEducationalScenesArabic(contentBudget, speakingRate, brandName);
-      }
-      return compileGroundedScenes(contract, durationSeconds);
-    }
-
-    // English scenes
-    if (lower.includes("website") || lower.includes("web") || lower.includes("design") || lower.includes("landing page") || lower.includes("site")) {
-      return this.buildWebDesignScenesEnglish(durPerScene, brandName, durationSeconds);
-    }
-    if (lower.includes("coffee") || lower.includes("cafe") || lower.includes("barista") || lower.includes("espresso")) {
-      return this.buildCafeScenesEnglish(durPerScene, brandName);
-    }
-    if (lower.includes("fitness") || lower.includes("gym") || lower.includes("workout") || lower.includes("training") || lower.includes("studio")) {
-      return this.buildFitnessScenesEnglish(durPerScene, brandName);
-    }
-    if (isBackupTopicEn || lower.includes("software") || lower.includes("tech")) {
-      return this.buildTechEducationalScenesEnglish(contentBudget, speakingRate, brandName);
-    }
-    return compileGroundedScenes(contract, durationSeconds);
-  }
-
-  /**
-   * Renders a matched fact pack into exactly 3 scenes (hook / explanation /
-   * closing), regardless of the normal 3-vs-4 scene-count tiering - a
-   * curated explanation is written to read naturally in three beats, and
-   * splitting it further would mean inventing filler between real sentences.
-   */
-  private buildFactPackScenes(pack: FactPackEntry, contentBudget: number): ProductionSceneSpec[] {
-    const dur = Math.round((contentBudget / 3) * 10) / 10;
-    return [
-      {
-        sceneIndex: 0,
-        purpose: "hook",
-        durationSeconds: dur,
-        narration: pack.hook.narration,
-        onScreenText: pack.hook.onScreenText,
-        stockSearchTerms: pack.hook.searchTerms,
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "cut",
-      },
-      {
-        sceneIndex: 1,
-        purpose: "solution",
-        durationSeconds: dur,
-        narration: pack.explanation.narration,
-        onScreenText: pack.explanation.onScreenText,
-        stockSearchTerms: pack.explanation.searchTerms,
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "fade",
-      },
-      {
-        sceneIndex: 2,
-        purpose: "cta",
-        durationSeconds: dur,
-        narration: pack.closing.narration,
-        onScreenText: pack.closing.onScreenText,
-        stockSearchTerms: pack.closing.searchTerms,
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "cut",
-        // Curiosity content does not close on an ad-style CTA (section 10);
-        // enforcePromptTruthSafety only overwrites onScreenText/narration
-        // with the resolved CTA for a scene it recognizes as inventing an
-        // ungrounded claim, and this closing line invents nothing, so it
-        // passes through unchanged unless the customer's own prompt supplied
-        // an explicit CTA (handled the same way as every other production).
-        notes: "fact_pack_closing",
-      },
-    ];
-  }
-
-  private buildWebDesignScenesEnglish(
-    dur: number,
-    brand?: string,
-    totalDuration = 30,
-  ): ProductionSceneSpec[] {
-    const bName = brand || "our agency";
-    if (totalDuration <= 22) {
       return [
         {
           sceneIndex: 0,
           purpose: "hook",
           durationSeconds: dur,
-          narration: "Are you losing valuable potential clients every day because your small business website looks outdated?",
-          onScreenText: "Is Your Website Losing You Clients?",
-          stockSearchTerms: ["laptop website browsing", "modern technology", "business work"],
-          visualPrompt: "Close-up of a sleek modern laptop displaying responsive clean landing page",
+          narration: `إليك أسهل طريقة للاهتمام بـ ${topicPhrase} بكل سهولة وسرعة.`,
+          onScreenText: topicPhrase,
+          stockSearchTerms: [topicPhrase, "real everyday life action", "professional subject close up"],
+          visualPrompt: `Dynamic real-world establishing shot about ${topicPhrase}`,
           visualSource: "stock",
           visualProvider: "pexels",
           transition: "cut",
@@ -628,10 +437,10 @@ export class LocalContentAIProvider implements ContentAIProvider {
           sceneIndex: 1,
           purpose: "solution",
           durationSeconds: dur,
-          narration: `${bName} builds clean, lightning fast, mobile friendly websites that showcase your services and earn instant trust.`,
-          onScreenText: "Fast · Responsive · Modern Design",
-          stockSearchTerms: ["web developer coding", "responsive design screen", "creative agency"],
-          visualPrompt: "Modern UI/UX designer working on website layout with creative screens",
+          narration: `نقدم لك حلولاً حقيقية تساعدك في ${topicPhrase} بأعلى جودة وأفضل تجربة.`,
+          onScreenText: "أعلى جودة وأفضل تجربة",
+          stockSearchTerms: [topicPhrase, "quality service", "happy customer"],
+          visualPrompt: `Focused professional context related to ${topicPhrase}`,
           visualSource: "stock",
           visualProvider: "pexels",
           transition: "fade",
@@ -640,10 +449,10 @@ export class LocalContentAIProvider implements ContentAIProvider {
           sceneIndex: 2,
           purpose: "cta",
           durationSeconds: dur,
-          narration: "Message our team on WhatsApp today to get started on your brand new high converting website.",
-          onScreenText: "Message Us on WhatsApp Today",
-          stockSearchTerms: ["mobile contact us", "happy client handshake", "technology"],
-          visualPrompt: "Happy business owner tapping on smartphone with WhatsApp message ready",
+          narration: ctaText,
+          onScreenText: ctaText,
+          stockSearchTerms: ["contact us", "smartphone communication", "customer service"],
+          visualPrompt: "Customer reaching out via mobile chat with friendly support",
           visualSource: "stock",
           visualProvider: "pexels",
           transition: "cut",
@@ -656,414 +465,10 @@ export class LocalContentAIProvider implements ContentAIProvider {
         sceneIndex: 0,
         purpose: "hook",
         durationSeconds: dur,
-        narration: "Are you losing valuable potential clients and revenue every single day because your business website looks outdated?",
-        onScreenText: "Is Your Website Losing You Clients?",
-        stockSearchTerms: ["frustrated business owner", "laptop computer search", "office work"],
-        visualPrompt: "Business professional looking at search results on modern laptop",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "cut",
-      },
-      {
-        sceneIndex: 1,
-        purpose: "problem",
-        durationSeconds: dur,
-        narration: "When customers search for your services, they expect a blazing fast, trustworthy modern site that works on mobile.",
-        onScreenText: "Trust Begins With Your Website",
-        stockSearchTerms: ["smartphone browsing website", "modern online store", "digital marketing"],
-        visualPrompt: "User smoothly scrolling through modern vibrant website on smartphone",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "cut",
-      },
-      {
-        sceneIndex: 2,
-        purpose: "solution",
-        durationSeconds: dur,
-        narration: `${bName} creates custom, lightning fast, responsive websites engineered to elevate your brand and drive real conversions.`,
-        onScreenText: "Fast · Responsive · High Converting",
-        stockSearchTerms: ["creative web design agency", "coding laptop screen", "technology team"],
-        visualPrompt: "Showcase of multiple digital device mockups displaying high end responsive websites",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "fade",
-      },
-      {
-        sceneIndex: 3,
-        purpose: "cta",
-        durationSeconds: dur,
-        narration: "Message our design team on WhatsApp today to claim your limited discount and launch your new website.",
-        onScreenText: "Message Us on WhatsApp Today",
-        stockSearchTerms: ["whatsapp communication", "business handshake", "happy customer"],
-        visualPrompt: "Customer service chat interaction on glowing smartphone screen with special offer badge",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "cut",
-      },
-    ];
-  }
-
-  private buildWebDesignScenesArabic(
-    dialect: ArabicDialect,
-    dur: number,
-    brand?: string,
-    totalDuration = 30,
-  ): ProductionSceneSpec[] {
-    const bName = brand || "فريقنا";
-    if (totalDuration <= 22) {
-      return [
-        {
-          sceneIndex: 0,
-          purpose: "hook",
-          durationSeconds: dur,
-          narration: "بتخسر عملاء كل يوم عشان معندكش موقع احترافي؟",
-          onScreenText: "موقع احترافي لشركتك",
-          stockSearchTerms: ["laptop website browsing", "modern technology", "business work"],
-          visualPrompt: "Close-up of a sleek modern laptop displaying responsive clean landing page",
-          visualSource: "stock",
-          visualProvider: "pexels",
-          transition: "cut",
-        },
-        {
-          sceneIndex: 1,
-          purpose: "solution",
-          durationSeconds: dur,
-          narration: `${bName} بيصمملك موقع سريع ومتوافق مع الموبايل يعرض خدماتك بأعلى جودة.`,
-          onScreenText: "تصميم سريع ومتوافق مع الموبايل",
-          stockSearchTerms: ["web developer coding", "responsive design screen", "creative agency"],
-          visualPrompt: "Modern UI/UX designer working on website layout with creative screens",
-          visualSource: "stock",
-          visualProvider: "pexels",
-          transition: "fade",
-        },
-        {
-          sceneIndex: 2,
-          purpose: "cta",
-          durationSeconds: dur,
-          narration: "تواصل معانا دلوقتي على واتساب وابدأ موقعك الجديد.",
-          onScreenText: "تواصل معنا عبر واتساب",
-          stockSearchTerms: ["mobile contact us", "happy client handshake", "technology"],
-          visualPrompt: "Happy business owner tapping on smartphone with WhatsApp message ready",
-          visualSource: "stock",
-          visualProvider: "pexels",
-          transition: "cut",
-        },
-      ];
-    }
-
-    return [
-      {
-        sceneIndex: 0,
-        purpose: "hook",
-        durationSeconds: dur,
-        narration: "بتخسر عملاء ومبيعات كل يوم عشان معندكش موقع إلكتروني احترافي؟",
-        onScreenText: "بتخسر عملاء بدون موقع؟",
-        stockSearchTerms: ["frustrated business owner", "laptop computer search", "office work"],
-        visualPrompt: "Business professional looking at search results on modern laptop",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "cut",
-      },
-      {
-        sceneIndex: 1,
-        purpose: "problem",
-        durationSeconds: dur,
-        narration: "العميل أول ما بيدور على خدمتك بيحب يشوف موقع سريع وشيك يثق فيه.",
-        onScreenText: "ثقة العميل تبدأ من موقعك",
-        stockSearchTerms: ["smartphone browsing website", "modern online store", "digital marketing"],
-        visualPrompt: "User smoothly scrolling through modern vibrant website on smartphone",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "cut",
-      },
-      {
-        sceneIndex: 2,
-        purpose: "solution",
-        durationSeconds: dur,
-        narration: `${bName} بنصمملك موقع سريع، متوافق مع الموبايل، وبأعلى معايير الجودة والسرعة.`,
-        onScreenText: "مواقع سريعة · متوافقة مع الموبايل",
-        stockSearchTerms: ["creative web design agency", "coding laptop screen", "technology team"],
-        visualPrompt: "Showcase of multiple digital device mockups displaying high end responsive websites",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "fade",
-      },
-      {
-        sceneIndex: 3,
-        purpose: "cta",
-        durationSeconds: dur,
-        narration: "تواصل معانا دلوقتي على واتساب واستفاد بعرض تصميم موقعك الإلكتروني الجديد.",
-        onScreenText: "تواصل معنا الآن عبر واتساب",
-        stockSearchTerms: ["whatsapp communication", "business handshake", "happy customer"],
-        visualPrompt: "Customer service chat interaction on glowing smartphone screen with special offer badge",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "cut",
-      },
-    ];
-  }
-
-  private buildClothingScenesArabic(
-    dialect: ArabicDialect,
-    dur: number,
-    brand?: string,
-    totalDuration = 30,
-  ): ProductionSceneSpec[] {
-    const bName = brand || "براندنا";
-    if (totalDuration <= 22) {
-      return [
-        {
-          sceneIndex: 0,
-          purpose: "hook",
-          durationSeconds: dur,
-          narration: "عايز تيشرت شيك ومريح يفضل معاك في كل خروجة؟",
-          onScreenText: "تيشرت الصيف المثالي",
-          stockSearchTerms: ["streetwear fashion", "young man tshirt", "urban clothing"],
-          visualPrompt: "Cinematic close-up of high quality cotton streetwear t-shirt with modern aesthetic lighting",
-          visualSource: "stock",
-          visualProvider: "pexels",
-          transition: "cut",
-        },
-        {
-          sceneIndex: 1,
-          purpose: "solution",
-          durationSeconds: dur,
-          narration: `مع كولكشن ${bName} الجديد، قطن مية في المية وقصة أوفر سايز رايقة.`,
-          onScreenText: "قطن 100% · قصة أوفر سايز",
-          stockSearchTerms: ["stylish clothes model", "modern clothing", "lifestyle"],
-          visualPrompt: "Hero product shot of stylish contemporary apparel",
-          visualSource: "stock",
-          visualProvider: "pexels",
-          transition: "fade",
-        },
-        {
-          sceneIndex: 2,
-          purpose: "cta",
-          durationSeconds: dur,
-          narration: "اطلب دلوقتي على واتساب واستفاد بخصم خاص وشحن سريع لباب بيتك.",
-          onScreenText: "اطلب الآن عبر واتساب",
-          stockSearchTerms: ["mobile shopping", "happy customer smartphone", "fashion store"],
-          visualPrompt: "Modern smartphone checkout with glowing discount banner",
-          visualSource: "stock",
-          visualProvider: "pexels",
-          transition: "cut",
-        },
-      ];
-    }
-
-    return [
-      {
-        sceneIndex: 0,
-        purpose: "hook",
-        durationSeconds: dur,
-        narration: "بتدور على تيشرت شيك ومريح يفضل معاك في كل خروجة؟",
-        onScreenText: "تيشرت الصيف المثالي",
-        stockSearchTerms: ["streetwear", "fashion model", "urban clothing"],
-        visualPrompt: "Cinematic close-up of high quality cotton streetwear t-shirt with modern aesthetic lighting",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "cut",
-      },
-      {
-        sceneIndex: 1,
-        purpose: "problem",
-        durationSeconds: dur,
-        narration: "معظم التيشرتات بتكش أو بتبهت بعد أول غسلة، والقصة مش دايمًا مظبوطة.",
-        onScreenText: "مشاكل التيشرتات العادية",
-        stockSearchTerms: ["young man fashion", "tshirt close up", "city street style"],
-        visualPrompt: "Stylistic urban fashion shot in golden hour sunlight",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "cut",
-      },
-      {
-        sceneIndex: 2,
-        purpose: "solution",
-        durationSeconds: dur,
-        narration: `مع كولكشن ${bName} الجديد، قطن مية في المية وقصة أوفر سايز رايقة تناسب كل ستايل.`,
-        onScreenText: "قطن 100% · قصة أوفر سايز",
-        stockSearchTerms: ["stylish clothes", "modern youth clothing", "lifestyle"],
-        visualPrompt: "Hero product shot of stylish contemporary apparel",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "fade",
-      },
-      {
-        sceneIndex: 3,
-        purpose: "cta",
-        durationSeconds: dur,
-        narration: "اطلب دلوقتي على واتساب واستفاد بخصم خاص وشحن سريع لباب بيتك.",
-        onScreenText: "اطلب الآن عبر واتساب",
-        stockSearchTerms: ["mobile shopping", "happy customer smartphone", "fashion store"],
-        visualPrompt: "Modern smartphone checkout with glowing discount banner",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "cut",
-      },
-    ];
-  }
-
-  private buildCafeScenesArabic(
-    dialect: ArabicDialect,
-    dur: number,
-    brand?: string,
-  ): ProductionSceneSpec[] {
-    const bName = brand || "الكافيه";
-    return [
-      {
-        sceneIndex: 0,
-        purpose: "hook",
-        durationSeconds: dur,
-        narration: "محتاج تفصل شوية وتبدأ يومك بفنجان قهوة يعدل المزاج؟",
-        onScreenText: "فنجان قهوة يعدل المزاج",
-        stockSearchTerms: ["coffee espresso", "barista pouring coffee", "cafe aesthetic"],
-        visualPrompt: "Slow motion pour of rich espresso with golden crema in a stylish modern cafe",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "cut",
-      },
-      {
-        sceneIndex: 1,
-        purpose: "solution",
-        durationSeconds: dur,
-        narration: `في ${bName} بنحضر كل كوباية بحب من أجود أنواع البن المحمص طازة.`,
-        onScreenText: "بن محمص طازة يومياً",
-        stockSearchTerms: ["coffee beans roasting", "barista crafting latte", "cafe interior"],
-        visualPrompt: "Warm cinematic cafe environment with aromatic roasted coffee beans",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "fade",
-      },
-      {
-        sceneIndex: 2,
-        purpose: "cta",
-        durationSeconds: dur,
-        narration: "زورنا النهاردة واستمتع بأحلى قعدة وأجمد عروض الفطار والقهوة.",
-        onScreenText: "زورنا اليوم واستمتع بالعرض",
-        stockSearchTerms: ["friends laughing in cafe", "coffee cup table", "happy customer"],
-        visualPrompt: "Cozy vibrant cafe seating area with smiling guests",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "cut",
-      },
-    ];
-  }
-
-  private buildFoodScenesArabic(
-    dialect: ArabicDialect,
-    dur: number,
-    brand?: string,
-  ): ProductionSceneSpec[] {
-    const bName = brand || "المطعم";
-    return [
-      {
-        sceneIndex: 0,
-        purpose: "hook",
-        durationSeconds: dur,
-        narration: "جعان ونفسك في ساندوتش برجر حقيقي يملى العين والبطن؟",
-        onScreenText: "برجر حقيقي على أصوله",
-        stockSearchTerms: ["sizzling burger grill", "burger cheese melting", "fast food"],
-        visualPrompt: "Extreme close up of sizzling smash burger patty with melting cheddar cheese",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "cut",
-      },
-      {
-        sceneIndex: 1,
-        purpose: "solution",
-        durationSeconds: dur,
-        narration: `${bName} بيقدملك لحمة بلدي مية في المية وصوصات سرية معمولة عشانك.`,
-        onScreenText: "لحمة بلدي 100% وصوصات سرية",
-        stockSearchTerms: ["gourmet burger preparation", "french fries crispy", "food restaurant"],
-        visualPrompt: "Delicious burger assembly with fresh brioche bun and crispy golden fries",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "fade",
-      },
-      {
-        sceneIndex: 2,
-        purpose: "cta",
-        durationSeconds: dur,
-        narration: "اطلب دلوقتي دليفري والعرض التوفيري هيوصلك سخن لحد عندك.",
-        onScreenText: "اطلب دليفري الآن",
-        stockSearchTerms: ["food delivery driver", "delicious burger meal", "eating burger"],
-        visualPrompt: "Steaming hot food delivery package and happy eating moment",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "cut",
-      },
-    ];
-  }
-
-  private buildRealEstateScenesArabic(
-    dialect: ArabicDialect,
-    dur: number,
-    brand?: string,
-  ): ProductionSceneSpec[] {
-    return [
-      {
-        sceneIndex: 0,
-        purpose: "hook",
-        durationSeconds: dur,
-        narration: "بتفكر في سكن راقي أو استثمار عقاري مضمون بعائد عالي؟",
-        onScreenText: "سكن راقي واستثمار مضمون",
-        stockSearchTerms: ["modern luxury apartment", "architecture building", "modern interior"],
-        visualPrompt: "Architectural drone shot of modern luxury residential compound",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "cut",
-      },
-      {
-        sceneIndex: 1,
-        purpose: "solution",
-        durationSeconds: dur,
-        narration: "وحدات مميزة بمساحات متنوعة وأنظمة سداد مرنة بدون فوائد وبأقل مقدم.",
-        onScreenText: "مساحات متنوعة · أنظمة سداد مرنة",
-        stockSearchTerms: ["luxury living room interior", "balcony view luxury", "apartment"],
-        visualPrompt: "Spacious sunlit living room with panoramic view",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "fade",
-      },
-      {
-        sceneIndex: 2,
-        purpose: "cta",
-        durationSeconds: dur,
-        narration: "تواصل معنا اليوم لحجز معاينة مجانية واغتنام الفرصة.",
-        onScreenText: "تواصل معنا الآن للمعانية",
-        stockSearchTerms: ["real estate handshake", "luxury home keys", "customer meeting"],
-        visualPrompt: "Client receiving keys to luxury home with warm handshake",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "cut",
-      },
-    ];
-  }
-
-  private buildGenericArabicScenes(
-    prompt: string,
-    dialect: ArabicDialect,
-    dur: number,
-    brand?: string,
-  ): ProductionSceneSpec[] {
-    // Previously spliced an arbitrarily-truncated raw substring of the
-    // user's own prompt straight into the narration (sliced to 40 chars with
-    // no regard for word boundaries - a genuine raw-prompt-leak defect).
-    // Replaced with the same deterministic topic-concept extraction the
-    // script-quality gate itself uses, so this fallback (used whenever the
-    // prompt matches no curated Arabic vertical) stays about the customer's
-    // actual subject regardless of what it is.
-    const topicConcepts = extractTopicConcepts(prompt, "ar").slice(0, 3);
-    const topicPhrase = topicConcepts.length > 0 ? topicConcepts.join(" \u0648") : "\u0627\u062D\u062A\u064A\u0627\u062C\u0627\u062A\u0643";
-    return [
-      {
-        sceneIndex: 0,
-        purpose: "hook",
-        durationSeconds: dur,
-        narration: `إليك أسهل طريقة للاهتمام بـ ${topicPhrase} بكل سهولة وسرعة.`,
+        narration: `Here is the simplest way to handle ${topicPhrase}.`,
         onScreenText: topicPhrase,
-        stockSearchTerms: ["modern technology", "business meeting", "lifestyle"],
-        visualPrompt: "Dynamic modern visual scene representing progress and success",
+        stockSearchTerms: [topicPhrase, `${topicPhrase} close up`, `${topicPhrase} in action`],
+        visualPrompt: `High energy establishing shot introducing ${topicPhrase}`,
         visualSource: "stock",
         visualProvider: "pexels",
         transition: "cut",
@@ -1072,10 +477,10 @@ export class LocalContentAIProvider implements ContentAIProvider {
         sceneIndex: 1,
         purpose: "solution",
         durationSeconds: dur,
-        narration: `نقدم لك حلولاً حقيقية تساعدك في ${topicPhrase} بأعلى جودة وأفضل تجربة.`,
-        onScreenText: "أعلى جودة وأفضل تجربة",
-        stockSearchTerms: ["quality service", "happy customer", "innovation"],
-        visualPrompt: "Focused modern professional delivering high quality results",
+        narration: `We help you get the most out of ${topicPhrase} with a simple, reliable approach.`,
+        onScreenText: `Better ${topicPhrase}`,
+        stockSearchTerms: [topicPhrase, "detailed shot close up", "positive result"],
+        visualPrompt: `Close up detail showcasing ${topicPhrase}`,
         visualSource: "stock",
         visualProvider: "pexels",
         transition: "fade",
@@ -1084,466 +489,7 @@ export class LocalContentAIProvider implements ContentAIProvider {
         sceneIndex: 2,
         purpose: "cta",
         durationSeconds: dur,
-        narration: "تواصل معنا الآن عبر واتساب لمعرفة كافة التفاصيل والاستفادة من العرض.",
-        onScreenText: "تواصل معنا الآن",
-        stockSearchTerms: ["contact us", "smartphone communication", "customer service"],
-        visualPrompt: "Customer reaching out via mobile chat with friendly support",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "cut",
-      },
-    ];
-  }
-
-  /**
-   * Duration-aware backup/tech content pack (ABUD_SHORTS_ENGINE_STATUS.md
-   * section 4-9). Each beat (hook/problem/solution/cta) has one REQUIRED
-   * line - the scene's core meaning, always included - plus real, grounded
-   * OPTIONAL supporting sentences that are added only as needed to reach
-   * this scene's share of `contentBudget` at the given voice's calibrated
-   * speaking rate (see scriptDurationController.ts). Nothing here is
-   * invented filler: every optional sentence is a genuine, on-topic
-   * elaboration a human copywriter would recognise as real ad copy for this
-   * exact vertical, not a padding trick.
-   */
-  private buildTechEducationalScenesEnglish(
-    contentBudget: number,
-    rate: SpeakingRateProfile,
-    brand?: string,
-  ): ProductionSceneSpec[] {
-    const beats: Array<{
-      id: string;
-      essential: boolean;
-      purpose: ProductionSceneSpec["purpose"];
-      onScreenText: string;
-      stockSearchTerms: string[];
-      visualPrompt: string;
-      transition: ProductionSceneSpec["transition"];
-      units: NarrationUnit[];
-    }> = [
-        {
-          id: "hook",
-          essential: true,
-          purpose: "hook",
-          onScreenText: "60% of Businesses Lose Data",
-          stockSearchTerms: ["server room blinking", "cyber security tech", "business computer"],
-          visualPrompt: "Dramatic illuminated server rack with blinking security lights",
-          transition: "cut",
-          units: [
-            {
-              role: "required",
-              text: "Did you know that 60% of small businesses lose critical data due to simple hardware failure?",
-            },
-            {
-              role: "optional",
-              text: "It rarely happens with any warning - one bad drive, one power surge, and years of records are gone.",
-            },
-            {
-              role: "optional",
-              text: "Client contracts, financial records, years of project files - all of it can vanish in a single moment.",
-            },
-          ],
-        },
-        {
-          id: "problem",
-          essential: false,
-          purpose: "problem",
-          onScreenText: "The Real Cost of Downtime",
-          stockSearchTerms: ["stressed worker computer", "cyber attack graphic", "technology failure"],
-          visualPrompt: "Stressed professional staring at frozen screen with error warning",
-          transition: "cut",
-          units: [
-            {
-              role: "required",
-              text: "Without automated off-site backups, one accidental deletion or ransomware attack can halt operations.",
-            },
-            {
-              role: "optional",
-              text: "Every hour spent trying to recover lost files is an hour not spent serving customers.",
-            },
-            {
-              role: "optional",
-              text: "And by the time you notice something is wrong, the version you need to restore might already be overwritten.",
-            },
-          ],
-        },
-        {
-          id: "solution",
-          essential: false,
-          purpose: "solution",
-          onScreenText: "Automated Encrypted Backups",
-          stockSearchTerms: ["cloud computing data", "secure backup progress", "cyber security"],
-          visualPrompt: "Sleek holographic backup synchronization with green checkmarks",
-          transition: "fade",
-          units: [
-            {
-              role: "required",
-              text: "Implementing encrypted daily backups ensures your files are restored in minutes, zero stress.",
-            },
-            {
-              role: "optional",
-              text: "A good backup routine runs quietly in the background, so protecting your work never becomes another task on your list.",
-            },
-            {
-              role: "optional",
-              text: "Whether it is a laptop, a shared drive, or a cloud folder, the same simple habit keeps everything recoverable.",
-            },
-          ],
-        },
-        {
-          id: "cta",
-          essential: true,
-          purpose: "cta",
-          onScreenText: "Follow For Daily Tech Tips",
-          stockSearchTerms: ["technology team success", "smiling engineer", "software development"],
-          visualPrompt: "Confident IT professional giving thumbs up with clean modern office background",
-          transition: "cut",
-          units: [
-            {
-              role: "required",
-              // Explicitly names "back up" and "files" (not just generic "tech
-              // tips") so the topic stays clear even when a tight budget drops
-              // the "problem"/"solution" beats and this required sentence ends
-              // up carrying the CTA alone (allocateBeatDurations).
-              text: "Follow for more tips on backing up your business files and keeping your work protected.",
-            },
-            {
-              role: "optional",
-              text: brand
-                ? `${brand} can help you set up a reliable backup routine in less time than you think.`
-                : "Setting up a reliable backup routine takes less time than you think.",
-            },
-            {
-              role: "optional",
-              text: "Start today, before the next hardware failure decides the timeline for you.",
-            },
-          ],
-        },
-      ];
-
-    // Scene-level rebalancing (section 9): a single required sentence at
-    // Kokoro's real calibrated rate can take longer than an equal 1/4 share
-    // of a short requested duration - allocate each beat's share
-    // proportional to its own required narration's real length instead, and
-    // drop the least-essential beats first if even the essential ones alone
-    // would not fit. See allocateBeatDurations's own doc comment.
-    const allocations = allocateBeatDurations(
-      beats.map((b) => ({ id: b.id, units: b.units, essential: b.essential })),
-      contentBudget,
-      rate,
-    );
-    const allocationById = new Map(allocations.map((a) => [a.id, a]));
-
-    return beats
-      .filter((beat) => allocationById.get(beat.id)?.included)
-      .map((beat, sceneIndex) => {
-        const targetSeconds = allocationById.get(beat.id)!.targetSeconds;
-        const composed = composeNarrationForDuration(beat.units, targetSeconds, rate);
-        const nextUnits = beat.units.slice(composed.unitsUsed);
-        return {
-          sceneIndex,
-          purpose: beat.purpose,
-          durationSeconds: targetSeconds,
-          narration: composed.text,
-          onScreenText: beat.onScreenText,
-          stockSearchTerms: beat.stockSearchTerms,
-          visualPrompt: beat.visualPrompt,
-          visualSource: "stock",
-          visualProvider: "pexels",
-          transition: beat.transition,
-          narrationExpansionUnits: nextUnits.length > 0 ? nextUnits.map((u) => u.text) : undefined,
-        };
-      });
-  }
-
-  /**
-   * Arabic counterpart of buildTechEducationalScenesEnglish - previously
-   * missing entirely (any Arabic backup/tech prompt fell through to the
-   * topic-neutral generic Arabic template). Same duration-aware composition.
-   *
-   * Short Studio 2.5 Arabic content-planning closure: this function used to
-   * split `contentBudget` into a fixed, equal quarter per beat regardless of
-   * duration - the actual root cause of the real Arabic overshoot (a scene
-   * planned for ~2.8s of an 11s budget, whose own REQUIRED sentence alone
-   * needs ~4.8s at VoiceTut/Mohamed's real calibrated rate, has no way to
-   * fit). `buildTechEducationalScenesEnglish` already solved this correctly
-   * via `allocateBeatDurations` - proportional, real-length-aware
-   * allocation that drops non-essential beats first when the budget is
-   * tight - but the Arabic counterpart never adopted it. Now it does,
-   * beat-for-beat identical in structure to the English version: hook/cta
-   * are essential (a short video is not useful without them), problem/
-   * solution are optional and are the first to be dropped for a tight
-   * budget, exactly like English already does. This is what makes scene
-   * count duration-aware instead of a hardcoded four, and reuses the same
-   * tested allocator rather than inventing Arabic-specific logic.
-   */
-  private buildTechEducationalScenesArabic(
-    contentBudget: number,
-    rate: SpeakingRateProfile,
-    brand?: string,
-  ): ProductionSceneSpec[] {
-    const beats: Array<{
-      id: string;
-      essential: boolean;
-      purpose: ProductionSceneSpec["purpose"];
-      onScreenText: string;
-      stockSearchTerms: string[];
-      visualPrompt: string;
-      transition: ProductionSceneSpec["transition"];
-      units: NarrationUnit[];
-    }> = [
-        {
-          id: "hook",
-          essential: true,
-          purpose: "hook",
-          onScreenText: "ملفات المشاريع الصغيرة",
-          stockSearchTerms: ["laptop typing files close up", "small business office desk"],
-          visualPrompt: "Close-up of hands typing on a laptop with business files visible",
-          transition: "cut",
-          units: [
-            { role: "required", text: "النسخ الاحتياطي لملفات المشاريع الصغيرة يعني نسخة احتياطية تحميك وقت أي عطل مفاجئ." },
-            { role: "optional", text: "عطل بسيط في الجهاز أو غلطة صغيرة، وشغل شهور كامل بيروح في ثانية." },
-            { role: "optional", text: "عقود عملائك، حساباتك، وكل ملفات مشروعك، ممكن تختفي في لحظة واحدة." },
-          ],
-        },
-        {
-          id: "problem",
-          essential: false,
-          purpose: "problem",
-          onScreenText: "خسارة الملفات بتكلفك وقتك",
-          stockSearchTerms: ["stressed business owner laptop", "frustrated worker computer"],
-          visualPrompt: "Frustrated small business owner staring at a frozen laptop screen",
-          transition: "cut",
-          units: [
-            { role: "required", text: "من غير نسخة احتياطية، أي مشكلة بسيطة ممكن توقفك عن شغلك تماماً." },
-            { role: "optional", text: "كل ساعة بتضيع في محاولة استرجاع ملفاتك، هي ساعة كنت ممكن تخدم فيها عملائك." },
-            { role: "optional", text: "وأحياناً لما تكتشف المشكلة، بيكون الوقت اتأخر والنسخة اللي محتاجها راحت خلاص." },
-          ],
-        },
-        {
-          id: "solution",
-          essential: false,
-          purpose: "solution",
-          onScreenText: "نسخة احتياطية يومية تلقائية",
-          stockSearchTerms: ["external hard drive close up", "cloud storage sync laptop"],
-          visualPrompt: "External hard drive connected to a laptop with a sync progress indicator",
-          transition: "fade",
-          units: [
-            { role: "required", text: "عشان كده لازم تعمل نسخة احتياطية لملفاتك بشكل دوري، وتحافظ على شغلك من الضياع." },
-            { role: "optional", text: "نسخة احتياطية منظمة بتشتغل من غير ما تحس، وتضمنلك إنك ترجع شغلك في دقايق." },
-            { role: "optional", text: "سواء الملفات على اللاب توب أو على السحابة، نفس العادة البسيطة بتحافظ على كل حاجة." },
-          ],
-        },
-        {
-          id: "cta",
-          essential: true,
-          purpose: "cta",
-          onScreenText: "ابدأ النسخ الاحتياطي",
-          stockSearchTerms: ["small business owner smiling laptop", "satisfied entrepreneur office"],
-          visualPrompt: "Small business owner smiling confidently while working on a laptop",
-          transition: "cut",
-          units: [
-            // Explicitly names "نسخة احتياطية" (backup copy) - not just generic
-            // "protect your files" - so the topic stays clear even when a
-            // tight budget drops the problem/solution beats (allocateBeatDurations)
-            // and this required sentence ends up carrying the CTA alone. Same
-            // length as the sentence it replaced (60 chars) to keep the same
-            // duration profile; mirrors the equivalent English CTA fix
-            // (buildTechEducationalScenesEnglish's own comment on this same
-            // pattern).
-            { role: "required", text: "ابدأ دلوقتي بخطة بسيطة للنسخ الاحتياطي، عشان ملفات مشروعك تفضل محفوظة." },
-            {
-              role: "optional",
-              text: brand
-                ? `${brand} بيساعدك تظبط نظام نسخ احتياطي موثوق في وقت أقل مما تتخيل.`
-                : "تنظيم نسخة احتياطية موثوقة بياخد وقت أقل بكتير مما تتخيل.",
-            },
-            { role: "optional", text: "ابدأ من دلوقتي، قبل ما عطل مفاجئ يحدد لك الميعاد بدل ما تختاره إنت." },
-          ],
-        },
-      ];
-
-    // Scene-level rebalancing (mirrors buildTechEducationalScenesEnglish
-    // exactly): allocate each beat's share of contentBudget proportional to
-    // its own required narration's real estimated length, dropping the
-    // least-essential beats first (problem, then solution) if even the
-    // essential ones alone would not fit. This is what makes scene count
-    // duration-aware for Arabic instead of a hardcoded four.
-    const allocations = allocateBeatDurations(
-      beats.map((b) => ({ id: b.id, units: b.units, essential: b.essential })),
-      contentBudget,
-      rate,
-    );
-    const allocationById = new Map(allocations.map((a) => [a.id, a]));
-
-    return beats
-      .filter((beat) => allocationById.get(beat.id)?.included)
-      .map((beat, sceneIndex) => {
-        const targetSeconds = allocationById.get(beat.id)!.targetSeconds;
-        const composed = composeNarrationForDuration(beat.units, targetSeconds, rate);
-        const nextUnits = beat.units.slice(composed.unitsUsed);
-        return {
-          sceneIndex,
-          purpose: beat.purpose,
-          durationSeconds: targetSeconds,
-          narration: composed.text,
-          onScreenText: beat.onScreenText,
-          stockSearchTerms: beat.stockSearchTerms,
-          visualPrompt: beat.visualPrompt,
-          visualSource: "stock",
-          visualProvider: "pexels",
-          transition: beat.transition,
-          narrationExpansionUnits: nextUnits.length > 0 ? nextUnits.map((u) => u.text) : undefined,
-        };
-      });
-  }
-
-  private buildCafeScenesEnglish(
-    dur: number,
-    brand?: string,
-  ): ProductionSceneSpec[] {
-    const bName = brand || "this coffee subscription";
-    return [
-      {
-        sceneIndex: 0,
-        purpose: "hook",
-        durationSeconds: dur,
-        narration: "Make every morning feel like your favorite cafe, without waiting in line.",
-        onScreenText: "Cafe Quality At Home",
-        stockSearchTerms: ["barista espresso close up", "coffee beans grinding", "coffee bag packaging"],
-        visualPrompt: "Close-up of fresh espresso extraction, roasted beans, and premium coffee packaging",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "cut",
-      },
-      {
-        sceneIndex: 1,
-        purpose: "solution",
-        durationSeconds: dur,
-        narration: `${bName} brings freshly roasted coffee to your routine with a simple, polished experience.`,
-        onScreenText: "Fresh Coffee, Delivered",
-        stockSearchTerms: ["coffee subscription box", "fresh roasted coffee beans", "barista pouring latte"],
-        visualPrompt: "Premium coffee box preparation with warm cafe lighting and latte craft detail",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "fade",
-      },
-      {
-        sceneIndex: 2,
-        purpose: "cta",
-        durationSeconds: dur,
-        narration: "Follow for better coffee moments and discover your next favorite roast.",
-        onScreenText: "Discover Your Next Roast",
-        stockSearchTerms: ["morning coffee at home", "coffee delivery package", "cafe lifestyle"],
-        visualPrompt: "Lifestyle shot of a person enjoying fresh coffee at home beside a delivered package",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "cut",
-      },
-    ];
-  }
-
-  private buildFitnessScenesEnglish(
-    dur: number,
-    brand?: string,
-  ): ProductionSceneSpec[] {
-    const bName = brand || "this boutique fitness studio";
-    return [
-      {
-        sceneIndex: 0,
-        purpose: "hook",
-        durationSeconds: dur,
-        narration: "Ready for workouts that feel focused, energetic, and built around real progress?",
-        onScreenText: "Train With Purpose",
-        stockSearchTerms: ["boutique fitness studio", "people gym training", "fitness class workout"],
-        visualPrompt: "Energetic boutique fitness class with focused members training under premium studio lighting",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "cut",
-      },
-      {
-        sceneIndex: 1,
-        purpose: "solution",
-        durationSeconds: dur,
-        narration: `${bName} pairs expert coaching with a motivating space that keeps every session moving.`,
-        onScreenText: "Coaching, Energy, Momentum",
-        stockSearchTerms: ["personal trainer coaching", "strength training gym", "athletic workout"],
-        visualPrompt: "Personal trainer guiding a strength session with crisp movement and confident pacing",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "fade",
-      },
-      {
-        sceneIndex: 2,
-        purpose: "cta",
-        durationSeconds: dur,
-        narration: "Follow for training ideas and find a studio routine that fits your week.",
-        onScreenText: "Find Your Routine",
-        stockSearchTerms: ["fitness studio members", "gym community workout", "healthy lifestyle training"],
-        visualPrompt: "Friendly fitness studio community finishing a workout with upbeat energy",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "cut",
-      },
-    ];
-  }
-
-  /**
-   * Used only when the prompt matches none of the business-vertical
-   * templates above (web design, coffee, fitness, tech). This local
-   * deterministic planner has no world knowledge, so it cannot write an
-   * informed explanation of an arbitrary topic (e.g. "why airplane windows
-   * are rounded") - that requires an LLM-backed Content AI provider. What it
-   * must never do is splice the customer's own raw prompt text into the
-   * narration: the previous version built `onScreenText` and the hook line
-   * directly from a truncated, punctuation-stripped copy of the prompt
-   * (`"Looking for the absolute best way to experience Create a 25second
-   * vertical cur?"` for a real benchmark run), which is both nonsensical and
-   * a raw-prompt-leak. This fallback stays topic-neutral instead, and does
-   * not assume the production is an advertisement (no "limited offer",
-   * no invented CTA channel - CTA text still comes from `resolveCtaProvenance`
-   * upstream in `enforcePromptTruthSafety`).
-   */
-  private buildGenericEnglishScenes(
-    prompt: string,
-    dur: number,
-    brand?: string,
-  ): ProductionSceneSpec[] {
-    // This fallback runs whenever the prompt matched no curated English
-    // vertical (web design/cafe/fitness/tech). It used to be pure filler
-    // with zero connection to what was actually asked for ("Here's
-    // something worth seeing... Here is what makes it worth your
-    // attention.") - topic-anchored with the same deterministic concept
-    // extraction the script-quality gate itself uses, so this template
-    // stays about the customer's actual subject regardless of what it is.
-    return [
-      {
-        sceneIndex: 0,
-        purpose: "hook",
-        durationSeconds: dur,
-        narration: "This topic needs a grounded script source before Short Studio can produce a factual explanation.",
-        stockSearchTerms: ["cinematic hero shot", "modern lifestyle", "close up detail"],
-        visualPrompt: "High energy cinematic establishing shot introducing the subject",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "cut",
-      },
-      {
-        sceneIndex: 1,
-        purpose: "solution",
-        durationSeconds: dur,
-        narration: "Connect the local LLM or a trusted content provider, then generate again for a reliable result.",
-        stockSearchTerms: ["quality craftsmanship", "detail shot", "modern technology"],
-        visualPrompt: "Close up detail showcasing quality and craft",
-        visualSource: "stock",
-        visualProvider: "pexels",
-        transition: "fade",
-      },
-      {
-        sceneIndex: 2,
-        purpose: "cta",
-        durationSeconds: dur,
-        narration: "Follow for more.",
+        narration: ctaText,
         stockSearchTerms: ["happy person reaction", "satisfied customer", "positive moment"],
         visualPrompt: "Genuine positive reaction shot to close the video",
         visualSource: "stock",

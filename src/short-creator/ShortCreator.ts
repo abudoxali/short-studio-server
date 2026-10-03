@@ -102,7 +102,7 @@ import { convertTemplateToProductionSpec } from "../server/v2/templateToSpec";
 import { VisualRegistry } from "../server/v2/visual-providers/registry";
 import { VoiceRegistry } from "../server/v2/voice-providers/registry";
 import type { VoiceProviderId, VoiceQualityProfile } from "../server/v2/voice-providers/types";
-import { AutoVisualRouter } from "../server/v2/visual-providers/router";
+import { AutoVisualRouter, StockVisualRejection } from "../server/v2/visual-providers/router";
 import { sceneSourceRouter } from "../server/v2/visual-providers/sceneSourceRouter";
 import { mediaIntelligenceService } from "../server/v2/media-intelligence/mediaIntelligenceService";
 import { mediaCache } from "../server/v2/media-cache/mediaCache";
@@ -1632,35 +1632,80 @@ export class ShortCreator {
                 "This production was set to use only your own media, but a scene could not be prepared from the selected items.",
               );
             }
-            segAsset = reusedSeg || segCustomerAsset || await this.visualRouter.resolveSceneVisual(
-              {
-                ...originalSceneSpec,
-                stockSearchTerms: sceneMediaPlan.searchCandidates || seg.searchTerms,
-                visualPrompt: seg.visualPrompt || originalSceneSpec.visualPrompt,
-              } as any,
-              spec,
-              {
-                excludeIds: excludeVideoIds,
-                orientation,
-                tempDirPath: this.config.tempDirPath,
-                targetDurationSeconds: seg.durationSeconds,
-                previousCandidates: previousVisualCandidates,
-                onPerf: onVisualPerf,
-              },
-            );
-            if (!reusedSeg && segAsset.provider === "pexels") artifactReuse.providerInvocations.pexels++;
-            const cacheId =
-              segAsset.metadata?.providerAssetId ||
-              segAsset.metadata?.stockAssetId ||
-              segAsset.metadata?.pexelsVideoId ||
-              segAsset.metadata?.pixabayVideoId ||
-              segAsset.url;
-            const cached = cacheId ? mediaCache.getCachedAsset(segAsset.provider, cacheId as any) : null;
-            if (cached) {
-              fs.copySync(cached.filePath, segVideoPath);
+            if (reusedSeg || segCustomerAsset) {
+              segAsset = reusedSeg || segCustomerAsset;
             } else {
-              await this.downloadFile(segAsset.url, segVideoPath);
-              if (cacheId) mediaCache.saveCachedAsset(segAsset.provider, cacheId as any, segVideoPath);
+              try {
+                segAsset = await this.visualRouter.resolveSceneVisual(
+                  {
+                    ...originalSceneSpec,
+                    stockSearchTerms: sceneMediaPlan.searchCandidates || seg.searchTerms,
+                    visualPrompt: seg.visualPrompt || originalSceneSpec.visualPrompt,
+                  } as any,
+                  spec,
+                  {
+                    excludeIds: excludeVideoIds,
+                    orientation,
+                    tempDirPath: this.config.tempDirPath,
+                    targetDurationSeconds: seg.durationSeconds,
+                    previousCandidates: previousVisualCandidates,
+                    onPerf: onVisualPerf,
+                  },
+                );
+              } catch (segRejection) {
+                if (!(segRejection instanceof StockVisualRejection)) throw segRejection;
+                logger.info(
+                  { sceneIndex: index, segmentIndex: seg.segmentIndex, reason: segRejection.details.reason },
+                  "Stock could not honestly illustrate this segment; rendering a purposeful motion-graphics segment instead",
+                );
+                const segMotion = await motionEngine.renderMotionScene({
+                  template: "kinetic_typography",
+                  title: String(originalSceneSpec.onScreenText || sceneTimeline.narration || spec.title || ""),
+                  subtitle: String((originalSceneSpec as any).displayText || ""),
+                  durationSeconds: seg.durationSeconds,
+                  width: orientation === "portrait" ? 1080 : 1920,
+                  height: orientation === "portrait" ? 1920 : 1080,
+                  fps: 25,
+                  brandColors: motionPalette,
+                  brand: motionBrandFields,
+                  language: spec.language,
+                });
+                fs.copySync(segMotion.absolutePath, segVideoPath);
+                segAsset = {
+                  sceneIndex: index,
+                  provider: "motion_canvas",
+                  source: "motion",
+                  url: `file://${segMotion.absolutePath}`,
+                  durationSeconds: seg.durationSeconds,
+                  fallbackUsed: true,
+                  estimatedCost: 0,
+                  metadata: {
+                    template: "kinetic_typography",
+                    source: "motion_canvas",
+                    stockRequired: false,
+                    stockFallback: {
+                      decision: "purposeful_motion_graphics",
+                      attempt: segRejection.details,
+                    },
+                  },
+                };
+              }
+            }
+            if (!reusedSeg && segAsset.provider === "pexels") artifactReuse.providerInvocations.pexels++;
+            if (segAsset.provider !== "motion_canvas") {
+              const cacheId =
+                segAsset.metadata?.providerAssetId ||
+                segAsset.metadata?.stockAssetId ||
+                segAsset.metadata?.pexelsVideoId ||
+                segAsset.metadata?.pixabayVideoId ||
+                segAsset.url;
+              const cached = cacheId ? mediaCache.getCachedAsset(segAsset.provider, cacheId as any) : null;
+              if (cached) {
+                fs.copySync(cached.filePath, segVideoPath);
+              } else {
+                await this.downloadFile(segAsset.url, segVideoPath);
+                if (cacheId) mediaCache.saveCachedAsset(segAsset.provider, cacheId as any, segVideoPath);
+              }
             }
             const mediaInputHash = createMediaInputHash({
               provider: segAsset.provider,
@@ -1808,20 +1853,24 @@ export class ShortCreator {
           spec.visualMode === "product_ad" ||
           originalSceneSpec.visualSource === "product_composition";
 
-        if (reusableMediaArtifact) {
-          artifactStore.copyToTemp(reusableMediaArtifact, tempVideoPath);
-          mediaArtifact = reusableMediaArtifact;
-          artifactReuse.reusedArtifacts.push(reusableMediaArtifact);
-          visualAsset = (reusableMediaArtifact.metadata?.visualAsset || reusableMediaArtifact.metadata || {}) as any;
-        } else if (isMotionGraphics) {
-          // The creative plan already decided what this scene shows, so the
-          // template follows the plan rather than the scene index. A pure
-          // graphic production must never need a stock clip, so every scene
-          // resolves to a motion template with a local generated ground.
+        /**
+         * Renders this scene through the local Motion Canvas runtime into
+         * tempVideoPath. Used both when the creative plan resolved the scene
+         * to a motion treatment and - the weak-stock case - when the stock
+         * router refused every candidate and a designed graphic is the honest
+         * visual for the beat. `stockFallback` carries the rejection evidence
+         * so the decision can be explained afterwards.
+         */
+        const renderSceneAsMotionClip = async (
+          forcedTreatment?: string,
+          stockFallback?: Record<string, unknown>,
+        ) => {
           const plannedTreatment = creativePlan.sceneTreatments.find(
             (entry) => entry.sceneIndex === index,
           );
           const motionTemplate: MotionTemplateType =
+            (forcedTreatment &&
+              TREATMENT_MOTION_TEMPLATE[forcedTreatment as keyof typeof TREATMENT_MOTION_TEMPLATE]) ||
             (plannedTreatment && TREATMENT_MOTION_TEMPLATE[plannedTreatment.treatment]) ||
             (spec.productionMode === "animated_explainer"
               ? index === 0
@@ -1876,13 +1925,13 @@ export class ShortCreator {
           });
 
           fs.copySync(motionResult.absolutePath, tempVideoPath);
-          visualAsset = {
+          return {
             sceneIndex: index,
             provider: "motion_canvas",
             source: "motion_graphics",
             url: `file://${motionResult.absolutePath}`,
             durationSeconds: targetSceneDuration,
-            fallbackUsed: false,
+            fallbackUsed: Boolean(stockFallback),
             estimatedCost: 0,
             metadata: {
               template: motionTemplate,
@@ -1894,8 +1943,18 @@ export class ShortCreator {
               preShapedArabic: motionResult.preShapedArabic,
               missingGlyphs: motionResult.missingGlyphs,
               brandFieldsDrawn: motionResult.brandFieldsDrawn,
+              stockFallback,
             },
-          };
+          } as any;
+        };
+
+        if (reusableMediaArtifact) {
+          artifactStore.copyToTemp(reusableMediaArtifact, tempVideoPath);
+          mediaArtifact = reusableMediaArtifact;
+          artifactReuse.reusedArtifacts.push(reusableMediaArtifact);
+          visualAsset = (reusableMediaArtifact.metadata?.visualAsset || reusableMediaArtifact.metadata || {}) as any;
+        } else if (isMotionGraphics) {
+          visualAsset = await renderSceneAsMotionClip();
         } else if (isProductAd) {
           let productMedia = null;
           const prodId = (spec.metadata as any)?.productImageId || (originalSceneSpec as any).productImageId;
@@ -2008,21 +2067,91 @@ export class ShortCreator {
               "This production was set to use only your own media, but a scene could not be prepared from the selected items.",
             );
           }
-          visualAsset = reusedAsset || sceneCustomerAsset || await this.visualRouter.resolveSceneVisual(
-            {
-              ...originalSceneSpec,
-              stockSearchTerms: intentPolicy.terms,
-            } as any,
-            spec,
-            {
-              excludeIds: excludeVideoIds,
-              orientation,
-              tempDirPath: this.config.tempDirPath,
-              targetDurationSeconds: targetSceneDuration,
-              previousCandidates: previousVisualCandidates,
-              onPerf: onVisualPerf,
-            },
-          );
+
+          const stockResolve = (terms: string[], generic: string[]) =>
+            this.visualRouter.resolveSceneVisual(
+              {
+                ...originalSceneSpec,
+                stockSearchTerms: terms,
+              } as any,
+              spec,
+              {
+                excludeIds: excludeVideoIds,
+                orientation,
+                tempDirPath: this.config.tempDirPath,
+                targetDurationSeconds: targetSceneDuration,
+                previousCandidates: previousVisualCandidates,
+                onPerf: onVisualPerf,
+                genericStockTerms: generic,
+              },
+            );
+          const genericTermsOf = (families: typeof queryFamilies) =>
+            families.queries.filter((entry) => entry.generic).map((entry) => entry.query);
+          const stockFallbackTreatment = (purpose?: string): string =>
+            purpose === "cta" ? "CTA_SCENE" : "KINETIC_TYPOGRAPHY";
+
+          if (reusedAsset || sceneCustomerAsset) {
+            visualAsset = reusedAsset || sceneCustomerAsset;
+          } else {
+            try {
+              visualAsset = await stockResolve(intentPolicy.terms, genericTermsOf(queryFamilies));
+            } catch (primaryRejection) {
+              if (!(primaryRejection instanceof StockVisualRejection)) throw primaryRejection;
+
+              // Bounded second attempt: a differently-rotated query family
+              // asks different angles before the scene gives up on footage.
+              const refinedFamilies = buildStockQueryFamilies({
+                narration: String(originalSceneSpec.narration || ""),
+                onScreenText: String(originalSceneSpec.onScreenText || ""),
+                purpose: String(originalSceneSpec.purpose || ""),
+                visualIntent: sceneMediaPlan.visualIntent,
+                industryHint: String((spec.metadata as any)?.creativeProfile?.industryHint || spec.title || ""),
+                mood: creativePlan.pacing,
+                providedTerms: plannedTerms as string[],
+                orientation: orientation === OrientationEnum.portrait ? "portrait" : "landscape",
+                sceneIndex: index + 13,
+              });
+              const refinedPolicy = applyVisualIntentPolicy({
+                terms: queryFamilyTerms(refinedFamilies),
+                narration: String(originalSceneSpec.narration || ""),
+                isWebsiteAd: websiteAdContext,
+                sceneIndex: index,
+              });
+              stockQueryLog.push({
+                sceneIndex: index,
+                refinement: true,
+                families: refinedFamilies.families,
+                queries: refinedFamilies.queries.map((entry) => entry.query),
+                matchedConcepts: refinedFamilies.matchedConcepts,
+                genericOnly: refinedFamilies.genericOnly,
+              });
+              try {
+                visualAsset = await stockResolve(refinedPolicy.terms, genericTermsOf(refinedFamilies));
+              } catch (refinedRejection) {
+                if (!(refinedRejection instanceof StockVisualRejection)) throw refinedRejection;
+                logger.info(
+                  {
+                    sceneIndex: index,
+                    firstReason: primaryRejection.details.reason,
+                    secondReason: refinedRejection.details.reason,
+                  },
+                  "Stock could not honestly illustrate this scene; rendering a purposeful motion-graphics scene instead",
+                );
+                visualAsset = await renderSceneAsMotionClip(
+                  stockFallbackTreatment(String(originalSceneSpec.purpose || "")),
+                  {
+                    decision: "purposeful_motion_graphics",
+                    firstAttempt: primaryRejection.details,
+                    secondAttempt: refinedRejection.details,
+                    queriesAttempted: [
+                      ...intentPolicy.terms,
+                      ...refinedPolicy.terms.filter((term) => !intentPolicy.terms.includes(term)),
+                    ],
+                  },
+                );
+              }
+            }
+          }
           if (!reusedAsset && visualAsset.provider === "pexels") artifactReuse.providerInvocations.pexels++;
           const sceneQueryRecord = stockQueryLog[stockQueryLog.length - 1];
           if (sceneQueryRecord) {
@@ -2035,66 +2164,72 @@ export class ShortCreator {
               visualAsset.metadata?.pexelsVideoId ||
               visualAsset.metadata?.pixabayVideoId ||
               visualAsset.url;
-            sceneQueryRecord.fallbackReason = visualAsset.metadata?.fallback
-              ? "provider_scoring_found_no_passing_candidate"
-              : undefined;
+            sceneQueryRecord.fallbackReason = visualAsset.metadata?.stockFallback
+              ? `stock_rejected:${String((visualAsset.metadata.stockFallback as any)?.decision || "purposeful_motion_graphics")}`
+              : visualAsset.metadata?.fallback
+                ? "provider_scoring_found_no_passing_candidate"
+                : undefined;
           }
 
-          const cacheId =
-            visualAsset.metadata?.providerAssetId ||
-            visualAsset.metadata?.stockAssetId ||
-            visualAsset.metadata?.pexelsVideoId ||
-            visualAsset.metadata?.pixabayVideoId ||
-            visualAsset.url;
-          const cached = cacheId ? mediaCache.getCachedAsset(visualAsset.provider, cacheId as any) : null;
-          if (cached) {
-            fs.copySync(cached.filePath, tempVideoPath);
-          } else {
-            await this.downloadFile(visualAsset.url, tempVideoPath);
-            if (cacheId) mediaCache.saveCachedAsset(visualAsset.provider, cacheId as any, tempVideoPath);
-          }
-
-          const semanticAssetId = String(cacheId || visualAsset.url);
-          const semanticAnalysis = await analyzeVideoSemanticSimilarity({
-            videoPath: tempVideoPath,
-            intentText: String(sceneMediaPlan.visualIntent || originalSceneSpec.purpose || ""),
-            provider: visualAsset.provider,
-            assetId: semanticAssetId,
-            cacheDir: path.join(this.config.dataDirPath, "semantic-cache"),
-          });
-          if (visualAsset.metadata) {
-            visualAsset.metadata.semanticAnalysis = semanticAnalysis;
-            visualAsset.metadata.perceptualHash = semanticAnalysis.perceptualHash;
-            visualAsset.metadata.frameSampleCount = semanticAnalysis.frameSampleCount;
-            visualAsset.metadata.semanticModelId = semanticAnalysis.modelId;
-            visualAsset.metadata.semanticRuntime = semanticAnalysis.runtime;
-            if (semanticAnalysis.semanticAvailable) {
-              visualAsset.metadata.visualSemanticScore = semanticAnalysis.visualSemanticScore;
+          // A motion-fallback scene is already a rendered clip in
+          // tempVideoPath: no provider download and no stock health analysis.
+          if (visualAsset.provider !== "motion_canvas") {
+            const cacheId =
+              visualAsset.metadata?.providerAssetId ||
+              visualAsset.metadata?.stockAssetId ||
+              visualAsset.metadata?.pexelsVideoId ||
+              visualAsset.metadata?.pixabayVideoId ||
+              visualAsset.url;
+            const cached = cacheId ? mediaCache.getCachedAsset(visualAsset.provider, cacheId as any) : null;
+            if (cached) {
+              fs.copySync(cached.filePath, tempVideoPath);
+            } else {
+              await this.downloadFile(visualAsset.url, tempVideoPath);
+              if (cacheId) mediaCache.saveCachedAsset(visualAsset.provider, cacheId as any, tempVideoPath);
             }
-            const nearDuplicate = previousVisualCandidates.find((candidate) =>
-              arePerceptuallyNearDuplicate(
-                String(candidate.perceptualHash || ""),
-                semanticAnalysis.perceptualHash,
-              ),
-            );
-            if (nearDuplicate) {
-              visualAsset.metadata.perceptualDuplicateOf = nearDuplicate.id || nearDuplicate.url;
-              visualAsset.metadata.diversityPenalty = 35;
-              visualAsset.metadata.rejectedCandidateReason = "perceptual_near_duplicate_previous_shot";
-            }
-          }
 
-          if (capabilityManager.isPythonQualityVenvInstalled() && fs.existsSync(tempVideoPath) && fs.statSync(tempVideoPath).size > 1024) {
-            try {
-              const sceneAnalysis = await qualityEngine.analyzeScenes(tempVideoPath, targetSceneDuration);
-              if (visualAsset.metadata) {
-                visualAsset.metadata.sceneAnalysis = sceneAnalysis;
-                visualAsset.metadata.selectedClip = sceneAnalysis.chosenWindow;
-                visualAsset.metadata.detectedScenesCount = sceneAnalysis.detectedScenes.length;
-                visualAsset.metadata.windowSelectionReason = sceneAnalysis.reason;
+            const semanticAssetId = String(cacheId || visualAsset.url);
+            const semanticAnalysis = await analyzeVideoSemanticSimilarity({
+              videoPath: tempVideoPath,
+              intentText: String(sceneMediaPlan.visualIntent || originalSceneSpec.purpose || ""),
+              provider: visualAsset.provider,
+              assetId: semanticAssetId,
+              cacheDir: path.join(this.config.dataDirPath, "semantic-cache"),
+            });
+            if (visualAsset.metadata) {
+              visualAsset.metadata.semanticAnalysis = semanticAnalysis;
+              visualAsset.metadata.perceptualHash = semanticAnalysis.perceptualHash;
+              visualAsset.metadata.frameSampleCount = semanticAnalysis.frameSampleCount;
+              visualAsset.metadata.semanticModelId = semanticAnalysis.modelId;
+              visualAsset.metadata.semanticRuntime = semanticAnalysis.runtime;
+              if (semanticAnalysis.semanticAvailable) {
+                visualAsset.metadata.visualSemanticScore = semanticAnalysis.visualSemanticScore;
               }
-            } catch (sdErr) {
-              logger.warn(sdErr, "PySceneDetect analysis notice; continuing with standard window");
+              const nearDuplicate = previousVisualCandidates.find((candidate) =>
+                arePerceptuallyNearDuplicate(
+                  String(candidate.perceptualHash || ""),
+                  semanticAnalysis.perceptualHash,
+                ),
+              );
+              if (nearDuplicate) {
+                visualAsset.metadata.perceptualDuplicateOf = nearDuplicate.id || nearDuplicate.url;
+                visualAsset.metadata.diversityPenalty = 35;
+                visualAsset.metadata.rejectedCandidateReason = "perceptual_near_duplicate_previous_shot";
+              }
+            }
+
+            if (capabilityManager.isPythonQualityVenvInstalled() && fs.existsSync(tempVideoPath) && fs.statSync(tempVideoPath).size > 1024) {
+              try {
+                const sceneAnalysis = await qualityEngine.analyzeScenes(tempVideoPath, targetSceneDuration);
+                if (visualAsset.metadata) {
+                  visualAsset.metadata.sceneAnalysis = sceneAnalysis;
+                  visualAsset.metadata.selectedClip = sceneAnalysis.chosenWindow;
+                  visualAsset.metadata.detectedScenesCount = sceneAnalysis.detectedScenes.length;
+                  visualAsset.metadata.windowSelectionReason = sceneAnalysis.reason;
+                }
+              } catch (sdErr) {
+                logger.warn(sdErr, "PySceneDetect analysis notice; continuing with standard window");
+              }
             }
           }
         }
@@ -2209,6 +2344,19 @@ export class ShortCreator {
                 };
               }
 
+              // The scene could not be honestly illustrated with stock and was
+              // rendered as a designed motion clip: every shot of it is that
+              // motion bed, cut into windows, never a second stock fetch.
+              if (visualAsset.provider === "motion_canvas") {
+                return {
+                  sourceType: "motion",
+                  provider: "motion_canvas",
+                  routingReason: visualAsset.metadata?.stockFallback
+                    ? "stock_rejected_purposeful_motion"
+                    : "motion_graphics_scene",
+                };
+              }
+
               if (
                 planned &&
                 !forceStockFootage &&
@@ -2261,6 +2409,17 @@ export class ShortCreator {
             // handed to the composer as an ordinary clip, so graphic scenes and
             // footage go through exactly one compositing path.
             if (shot.sourceType === "motion") {
+              // A scene-level stock rejection already rendered one motion clip
+              // covering the whole scene duration - shots cut windows from it
+              // rather than rendering the same template again per shot.
+              if (visualAsset.provider === "motion_canvas" && visualAsset.metadata?.stockFallback) {
+                shotInputs.push({
+                  shot,
+                  sourcePath: tempVideoPath,
+                  sourceStartSeconds: Math.max(0, (shot.start || 0) - sceneStartSeconds),
+                });
+                continue;
+              }
               const planned = creativePlan.sceneTreatments.find((entry) => entry.sceneIndex === index);
               const template = planned
                 ? TREATMENT_MOTION_TEMPLATE[planned.treatment] || "kinetic_typography"
@@ -2513,6 +2672,40 @@ export class ShortCreator {
                       reason: shotAssetError instanceof Error ? shotAssetError.message : String(shotAssetError),
                     },
                   ];
+                  if (shotAssetError instanceof StockVisualRejection) {
+                    // Stock could not honestly illustrate this beat: a
+                    // designed motion shot is better than re-cutting the same
+                    // scene clip a second time.
+                    try {
+                      const planned = creativePlan.sceneTreatments.find((entry) => entry.sceneIndex === index);
+                      const motionScene = await motionEngine.renderMotionScene({
+                        template: (planned && TREATMENT_MOTION_TEMPLATE[planned.treatment]) || "kinetic_typography",
+                        title: String(originalSceneSpec.onScreenText || sceneTimeline.narration || spec.title || ""),
+                        subtitle: String((originalSceneSpec as any).displayText || ""),
+                        ctaText: brandStyle.ctaText,
+                        contactText: spec.contact || spec.brandKit?.contactText,
+                        durationSeconds: shot.duration,
+                        width: orientation === "portrait" ? 1080 : 1920,
+                        height: orientation === "portrait" ? 1920 : 1080,
+                        fps: 25,
+                        brandColors: motionPalette,
+                        brand: motionBrandFields,
+                        language: spec.language,
+                      });
+                      if (fs.existsSync(motionScene.absolutePath)) {
+                        shot.sourceType = "motion";
+                        shot.provider = "motion_canvas";
+                        shot.routingReason = `${shot.routingReason || ""}|stock_rejected_motion_fallback`;
+                        shotInputs.push({ shot, sourcePath: motionScene.absolutePath, sourceStartSeconds: 0 });
+                        continue;
+                      }
+                    } catch (motionShotError) {
+                      logger.warn(
+                        { err: String(motionShotError), sceneIndex: index, shotId: shot.shotId },
+                        "Motion fallback shot render failed; reusing the scene asset",
+                      );
+                    }
+                  }
                   shot.routingReason = `${shot.routingReason || ""}|shot_specific_asset_failed_reused_scene_asset`;
                 }
               }

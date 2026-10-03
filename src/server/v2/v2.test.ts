@@ -1066,7 +1066,7 @@ describe("V2 routes", () => {
     expect(surface).not.toContain("local_ai");
   });
 
-  it("V2.4 Pass 5.1: still creates the job normally for a curated-fact-pack curiosity topic", async () => {
+  it("V2.4 Pass 5.1: still creates the job normally for a business brief in Basic mode", async () => {
     nock("http://127.0.0.1:1")
       .post("/webhook/abud-v2/jobs/start")
       .reply(202, { accepted: true });
@@ -1080,15 +1080,17 @@ describe("V2 routes", () => {
       .post("/api/v2/production/jobs")
       .set(authHeader)
       .send({
-        prompt: "Why do phone batteries charge much slower after about 80%?",
+        prompt: "Create a 20-second vertical ad for our web design service.",
         language: "en",
         durationSeconds: 20,
       });
 
     expect(res.status).toBe(202);
     const job = await db.jobs.get(res.body.jobId);
-    expect(job?.production_spec?.metadata?.contentProvenance).toBe("DETERMINISTIC");
-    expect(job?.production_spec?.metadata?.factPackId).toBe("phone_battery_slow_after_80");
+    // The fact-pack/DETERMINISTIC pipeline was removed in the production-
+    // intelligence recovery; the labelled Basic planner emits
+    // BASIC_FALLBACK provenance and never invents a contact channel.
+    expect(job?.production_spec?.metadata?.contentProvenance).toBe("BASIC_FALLBACK");
     expect(job?.production_spec?.cta?.contact).toBeUndefined();
   });
 

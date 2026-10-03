@@ -13,7 +13,7 @@ export type WorkerLeaseRecord = {
 };
 
 export class WorkerLeaseService {
-  constructor(private db: V2Database) {}
+  constructor(private db: V2Database) { }
 
   public defaultWorkerId(): string {
     return process.env.WORKER_ID || `${os.hostname()}-${process.pid}`;
@@ -175,7 +175,7 @@ export class WorkerLeaseService {
          SET status = 'queued',
              current_stage = 'Queued after expired worker lease',
              updated_at = now()
-         WHERE id = ANY($1) AND status NOT IN ('ready','failed','canceled')`,
+         WHERE id = ANY($1) AND status NOT IN ('ready','needs_review','failed','canceled')`,
         [recoveredJobs],
       );
     }

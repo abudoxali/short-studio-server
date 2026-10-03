@@ -82,11 +82,11 @@ describe("migration safety — v2.2 to v2.3 upgrade compatibility", () => {
     }
   });
 
-  it("only needs to apply 2.13.0 on top of a v2.2.0 (2.12.0) database, additively", async () => {
+  it("only needs to apply 2.13.0 and 2.14.0 on top of a v2.2.0 (2.12.0) database, additively", async () => {
     const deltaFrom212 = MIGRATIONS.filter(
       (m) => m.version.localeCompare("2.12.0", undefined, { numeric: true }) > 0,
     );
-    expect(deltaFrom212.map((m) => m.version)).toEqual(["2.13.0"]);
+    expect(deltaFrom212.map((m) => m.version)).toEqual(["2.13.0", "2.14.0"]);
 
     const idx = MIGRATIONS.findIndex((m) => m.version === "2.13.0");
     const sql = await collectSql(idx);
@@ -96,5 +96,14 @@ describe("migration safety — v2.2 to v2.3 upgrade compatibility", () => {
     expect(sql).toMatch(/CREATE INDEX IF NOT EXISTS/i);
     // Never touches the data a v2.2 customer already has.
     expect(sql).not.toMatch(/\b(jobs|brands|generated_assets|video_revisions|publications|provider_credentials_vault|admin_users)\b\s+DROP/i);
+  });
+
+  it("2.14.0 only removes triggers - it never deletes rows", async () => {
+    const idx = MIGRATIONS.findIndex((m) => m.version === "2.14.0");
+    const sql = await collectSql(idx);
+    expect(sql).toMatch(/DROP TRIGGER IF EXISTS trg_cleanup_failed_jobs/i);
+    expect(sql).toMatch(/DROP TRIGGER IF EXISTS trg_convert_needs_review/i);
+    expect(sql).not.toMatch(/\bDELETE\s+FROM\b/i);
+    expect(sql).not.toMatch(/\bDROP\s+(TABLE|COLUMN|FUNCTION)\b/i);
   });
 });

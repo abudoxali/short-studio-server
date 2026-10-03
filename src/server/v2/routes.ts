@@ -38,6 +38,7 @@ import {
   voiceRevisionSchema,
 } from "./types";
 import { ContentAIRegistry } from "./content-ai/registry";
+import { ContentPlannerError } from "./content-ai/ollamaProvider";
 import { validateScriptQuality } from "./content-ai/scriptQuality";
 import { estimateProductionCost } from "./cost-estimator";
 import {
@@ -894,14 +895,14 @@ export function canonicalizeProductionSpecContract(
   const arabicVoice: ResolvedArabicVoice | null =
     resolvedVoiceProvider === ARABIC_PREMIUM_CLOUD_PROVIDER
       ? resolveArabicVoiceSelection({
-          requestedVoiceId,
-          requestedPreset:
-            coerceRequestedPreset(controls.voicePreset) ??
-            (canReuseSpecVoice ? coerceRequestedPreset(spec.voicePreset) : undefined),
-          brandVoice: defaults.brandArabicVoice,
-          persisted: defaults.arabicVoice,
-          defaultModelId: ELEVENLABS_DEFAULT_MODEL_ID,
-        })
+        requestedVoiceId,
+        requestedPreset:
+          coerceRequestedPreset(controls.voicePreset) ??
+          (canReuseSpecVoice ? coerceRequestedPreset(spec.voicePreset) : undefined),
+        brandVoice: defaults.brandArabicVoice,
+        persisted: defaults.arabicVoice,
+        defaultModelId: ELEVENLABS_DEFAULT_MODEL_ID,
+      })
       : null;
   const voiceId = arabicVoice
     ? arabicVoice.voiceId
@@ -1015,12 +1016,12 @@ export function canonicalizeProductionSpecContract(
               : visualSource === "auto_budget"
                 ? "Auto Budget"
                 : visualSource === "stock"
-              ? "Stock"
-              : visualSource === "uploaded_media"
-                ? "Uploaded Media"
-                : visualSource === "ai_generated"
-                  ? "AI Generated"
-                  : "Mixed",
+                  ? "Stock"
+                  : visualSource === "uploaded_media"
+                    ? "Uploaded Media"
+                    : visualSource === "ai_generated"
+                      ? "AI Generated"
+                      : "Mixed",
         stockProvider,
         mediaPolicy,
         selectedMediaIds,
@@ -1242,12 +1243,27 @@ async function arabicProductionBlocker(spec: {
  * "SAFE_GENERIC" when they actually succeeded.
  */
 function contentConfidenceBlocker(spec: {
-  metadata?: { contentProvenance?: string } | null;
-}): { error: string; message: string; action: { label: string; href: string } } | null {
-  if (spec.metadata?.contentProvenance !== "SAFE_GENERIC") return null;
+  contentStyle?: string;
+  metadata?: { contentProvenance?: string; contentConfidence?: string } | null;
+}): { error: string; message: string; messageAr?: string; action: { label: string; href: string } } | null {
+  const provenance = spec.metadata?.contentProvenance;
+  const curiosity =
+    spec.contentStyle === "viral_curiosity" ||
+    spec.contentStyle === "educational" ||
+    spec.contentStyle === "explainer";
+  // Legacy marker (older stored specs) plus the current Basic fallback:
+  // generic narration for a factual/explainer request is worthless, so the
+  // create is refused with an actionable message rather than producing a
+  // low-confidence video silently. Business/ad briefs in Basic mode still
+  // create - a generic ad beats nothing when the customer chose Basic.
+  const blocked =
+    provenance === "SAFE_GENERIC" ||
+    (provenance === "BASIC_FALLBACK" && curiosity && spec.metadata?.contentConfidence === "low");
+  if (!blocked) return null;
   return {
     error: "content_confidence_low",
     message: "Better content generation is needed for this topic. Connect a Content AI provider or adjust the prompt.",
+    messageAr: "هذا الموضوع يحتاج توليد محتوى أذكى. فعّل خدمة Local AI أو عدّل الوصف ثم حاول مرة أخرى.",
     action: { label: "Connect a Content AI Provider", href: "/providers" },
   };
 }
@@ -1274,6 +1290,98 @@ function scriptQualityBlocker(
     message: result.reason || "Short Studio could not create a sufficiently specific script for this topic. Please add more detail or enable an advanced content provider.",
     action: { label: "Connect a Content AI Provider", href: "/providers" },
   };
+}
+
+/**
+ * Long-running planner endpoints (create job, spec preview, prompt enhance)
+ * may legitimately need up to ~2 minutes for a local-LLM plan. The global
+ * REQUEST_TIMEOUT_MS socket budget is 30s - far below the planner timeout -
+ * which used to kill the request mid-generation and surface as an empty
+ * reply / generic UI banner. These endpoints widen only their own socket.
+ */
+const PLANNER_REQUEST_TIMEOUT_MS = 180_000;
+
+function plannerRouteTimeout(req: ExpressRequest): void {
+  req.setTimeout(PLANNER_REQUEST_TIMEOUT_MS);
+}
+
+/**
+ * Structured, localized failure surface for job creation. Customer-facing
+ * `message`/`messageAr` describe the actionable cause; raw provider/engine
+ * exceptions stay in server logs (and a sanitized `code` reference) instead
+ * of leaking into the UI, where the Arabic locale previously collapsed every
+ * failure into the generic "couldn't create the production" banner.
+ */
+function sendCreateFailure(
+  res: ExpressResponse,
+  error: unknown,
+  context: string,
+): void {
+  const raw = error instanceof Error ? error.message : String(error);
+  logger.error({ err: raw, context }, "job creation failed");
+
+  if (error instanceof ContentPlannerError || (error as any)?.plannerCode) {
+    const code = (error as ContentPlannerError).plannerCode;
+    res.status(503).json({
+      error: code,
+      message:
+        code === "planner_unavailable"
+          ? "The local AI planner is unavailable right now. Check that the Local AI service is running, then try again."
+          : "The local AI planner could not produce a valid creative plan. Please try again.",
+      messageAr:
+        code === "planner_unavailable"
+          ? "محرك الذكاء الاصطناعي المحلي غير متاح الآن. تأكد من تشغيل خدمة Local AI ثم حاول مرة أخرى."
+          : "تعذّر على محرك الذكاء الاصطناعي المحلي إنشاء خطة إنتاج صالحة. حاول مرة أخرى.",
+      code: `SS-PLANNER-${code === "planner_unavailable" ? "DOWN" : "BAD"}`,
+    });
+    return;
+  }
+
+  if (/CONTENT_DURATION_BUDGET_NOT_MET/.test(raw)) {
+    res.status(409).json({
+      error: "duration_budget_not_met",
+      message:
+        "The requested narration is too long for the chosen video duration. Increase the duration or shorten the description.",
+      messageAr:
+        "النص المطلوب أطول من مدة الفيديو المحددة. زد المدة أو اختصر الوصف وحاول مرة أخرى.",
+      code: "SS-DURATION-BUDGET",
+    });
+    return;
+  }
+
+  res.status(400).json({
+    error: "Invalid job payload",
+    message: "The production request could not be completed. Check your inputs and try again.",
+    messageAr: "تعذّر إنشاء الإنتاج. راجع المدخلات وحاول مرة أخرى.",
+    code: "SS-CREATE-400",
+  });
+}
+
+/**
+ * Job state-mutation routes (worker callbacks AND customer cancel/retry)
+ * must never let a domain error escape as an unhandled rejection - the
+ * phonemizer WASM bridge rethrows unhandled rejections and kills the whole
+ * process. A worker posting progress on a job the customer just cancelled,
+ * or a retry on a missing record, is an expected race, not a crash.
+ */
+function sendJobMutationFailure(
+  res: ExpressResponse,
+  error: unknown,
+  context: string,
+): void {
+  const raw = error instanceof Error ? error.message : String(error);
+  if (/Job not found/i.test(raw)) {
+    res.status(404).json({ error: "Job not found." });
+    return;
+  }
+  if (/Invalid job transition/i.test(raw)) {
+    // A cancelled/finished job legitimately rejects late worker progress;
+    // telling the caller 409 lets it stop retrying instead of crashing us.
+    res.status(409).json({ error: "job_state_conflict", message: raw.slice(0, 300) });
+    return;
+  }
+  logger.error({ err: raw, context }, "job mutation failed");
+  res.status(500).json({ error: "Job update failed." });
 }
 
 function hasCommandHint(envKey: string): boolean {
@@ -2167,9 +2275,9 @@ export function createV2PublicRouter(
         captionStyle: parsed.data.captionProfile || baseSpec.captionStyle,
         scenes: parsed.data.spokenNarration
           ? baseSpec.scenes.map((scene: any, index: number) => ({
-              ...scene,
-              spokenNarration: index === 0 ? parsed.data.spokenNarration : scene.spokenNarration,
-            }))
+            ...scene,
+            spokenNarration: index === 0 ? parsed.data.spokenNarration : scene.spokenNarration,
+          }))
           : baseSpec.scenes,
         metadata: {
           ...(baseSpec.metadata || {}),
@@ -2247,10 +2355,10 @@ export function createV2PublicRouter(
         scenes: baseSpec.scenes.map((scene: any, index: number) =>
           index === parsed.data.sceneIndex
             ? {
-                ...scene,
-                stockSearchTerms: parsed.data.searchTerms || scene.stockSearchTerms,
-                visualIntent: parsed.data.visualIntent || scene.visualIntent,
-              }
+              ...scene,
+              stockSearchTerms: parsed.data.searchTerms || scene.stockSearchTerms,
+              visualIntent: parsed.data.visualIntent || scene.visualIntent,
+            }
             : scene,
         ),
         metadata: {
@@ -2377,6 +2485,7 @@ export function createV2PublicRouter(
 
   // Preview Production Spec generated from a prompt
   router.post("/production-spec/preview", async (req, res) => {
+    plannerRouteTimeout(req);
     const parsed = productionSpecPreviewSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({
@@ -2415,15 +2524,13 @@ export function createV2PublicRouter(
         contentConfidenceWarning: confidenceBlock?.message,
       });
     } catch (error) {
-      res.status(500).json({
-        error: "Failed to generate preview spec",
-        message: error instanceof Error ? error.message : String(error),
-      });
+      sendCreateFailure(res, error, "production-spec/preview");
     }
   });
 
   // Prompt Enhancement
   router.post("/prompt/enhance", async (req, res) => {
+    plannerRouteTimeout(req);
     const parsed = promptEnhanceRequestSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({
@@ -2445,10 +2552,7 @@ export function createV2PublicRouter(
       });
       res.status(200).json(result);
     } catch (error) {
-      res.status(500).json({
-        error: "Failed to enhance prompt",
-        message: error instanceof Error ? error.message : String(error),
-      });
+      sendCreateFailure(res, error, "prompt/enhance");
     }
   });
 
@@ -2514,6 +2618,7 @@ export function createV2PublicRouter(
   });
 
   router.post("/production/jobs", async (req, res) => {
+    plannerRouteTimeout(req);
     const parsed = productionJobSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: "Invalid production job payload.", issues: parsed.error.flatten() });
@@ -2538,10 +2643,10 @@ export function createV2PublicRouter(
         aspectRatio: parsed.data.aspectRatio,
         quality: qualityMap[parsed.data.qualityProfile],
         visualMode: parsed.data.visualMode,
-          voiceProvider: "auto",
-          voiceId: parsed.data.voice,
-          brandId: parsed.data.brandId,
-        } as any);
+        voiceProvider: "auto",
+        voiceId: parsed.data.voice,
+        brandId: parsed.data.brandId,
+      } as any);
       const canonicalSpec = await canonicalizeProductionSpecForRequest(db, spec, {
         ...parsed.data,
         quality: qualityMap[parsed.data.qualityProfile],
@@ -2597,7 +2702,7 @@ export function createV2PublicRouter(
         eventsUrl: `/api/v2/jobs/${job.id}/events`,
       });
     } catch (error) {
-      res.status(500).json({ error: "Failed to create production job.", message: error instanceof Error ? error.message : String(error) });
+      sendCreateFailure(res, error, "POST /production/jobs");
     }
   });
 
@@ -2659,6 +2764,7 @@ export function createV2PublicRouter(
 
   // Create Video Job (supports prompt mode or template mode)
   router.post("/jobs", async (req, res) => {
+    plannerRouteTimeout(req);
     const rawPayload = req.body || {};
     const parsed = createVideoJobSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -2804,10 +2910,7 @@ export function createV2PublicRouter(
       }
       res.status(201).json({ job });
     } catch (error) {
-      res.status(400).json({
-        error: "Invalid job payload",
-        message: error instanceof Error ? error.message : "Validation failed.",
-      });
+      sendCreateFailure(res, error, "POST /jobs");
     }
   });
 
@@ -3607,14 +3710,14 @@ export function createV2PublicRouter(
       elevenLabsConfigured && shouldValidateLocalVoiceModels
         ? await elevenLabsVoiceDefaultState(elevenLabsProvider, storedArabicVoiceDefault)
         : {
-            defaultArabicVoiceConfigured: Boolean(storedArabicVoiceDefault?.voiceId),
-            defaultArabicVoiceAvailable: undefined,
-            defaultArabicVoiceName: storedArabicVoiceDefault?.voiceName,
-            voiceCatalogueAvailable: undefined,
-            arabicProductionReady: false,
-            setupRequiredReason: storedArabicVoiceDefault?.voiceId ? undefined : "default_arabic_voice_not_selected",
-            warnings: [],
-          };
+          defaultArabicVoiceConfigured: Boolean(storedArabicVoiceDefault?.voiceId),
+          defaultArabicVoiceAvailable: undefined,
+          defaultArabicVoiceName: storedArabicVoiceDefault?.voiceName,
+          voiceCatalogueAvailable: undefined,
+          arabicProductionReady: false,
+          setupRequiredReason: storedArabicVoiceDefault?.voiceId ? undefined : "default_arabic_voice_not_selected",
+          warnings: [],
+        };
     const googleTts = new GoogleCloudTtsProvider();
     const googleTtsValidation = voiceResults.find((provider) => provider.provider === "Google Cloud TTS");
     const googleTtsConfigured = googleTts.isConfigured();
@@ -4177,14 +4280,14 @@ export function createV2PublicRouter(
           vaultConfigured: provider.id ? vaultCredentials.some((credential) => credential.providerId === provider.id) : false,
           vault: provider.id
             ? vaultCredentials
-                .filter((credential) => credential.providerId === provider.id)
-                .map((credential) => ({
-                  credentialType: credential.credentialType,
-                  maskedHint: credential.maskedHint,
-                  health: credential.health,
-                  configuredAt: credential.configuredAt,
-                  lastTestedAt: credential.lastTestedAt,
-                }))
+              .filter((credential) => credential.providerId === provider.id)
+              .map((credential) => ({
+                credentialType: credential.credentialType,
+                maskedHint: credential.maskedHint,
+                health: credential.health,
+                configuredAt: credential.configuredAt,
+                lastTestedAt: credential.lastTestedAt,
+              }))
             : [],
         };
         return canonicalizeProviderPayload(enriched);
@@ -5757,10 +5860,15 @@ export function createV2InternalRouter(
       if (dispatchErr) throw dispatchErr;
       res.status(202).json({ accepted: true, jobId: job.id });
     } catch (error) {
-      await jobs.updateJob(job.id, "failed", job.progress, "Render dispatch failed", "Render worker is unavailable.", {
-        error: "Render worker is unavailable.",
-        technicalError: error instanceof Error ? error.message : String(error),
-      });
+      try {
+        await jobs.updateJob(job.id, "failed", job.progress, "Render dispatch failed", "Render worker is unavailable.", {
+          error: "Render worker is unavailable.",
+          technicalError: error instanceof Error ? error.message : String(error),
+        });
+      } catch {
+        // The job may already be canceled/failed - a second transition
+        // rejection inside the error path must not take the process down.
+      }
       await workerLeaseService?.release(workerId);
       res.status(503).json({ error: "Render worker is unavailable." });
     }
@@ -5777,32 +5885,36 @@ export function createV2InternalRouter(
       return;
     }
     const update = parsed.data;
-    const job = await jobs.updateJob(
-      req.params.id,
-      update.status,
-      update.progress,
-      update.currentStage,
-      update.message,
-      { technicalMessage: update.technicalMessage },
-    );
-    if (update.stageKey && update.checkpointStatus) {
-      await jobs.updateStageCheckpoint(req.params.id, update.stageKey, update.checkpointStatus, {
-        input: update.inputHashSource,
-        provider: update.provider,
-        artifacts: update.artifacts,
-        error: update.technicalMessage,
-        timingMs: update.timingMs,
-      });
-      if (update.checkpointStatus === "completed") {
-        const webhookService = db ? new WebhookService(db, { timeoutMs: config.webhookTimeoutMs }) : null;
-        await webhookService?.dispatchEvent("job.stage.completed", {
-          jobId: req.params.id,
-          stage: update.stageKey,
+    try {
+      const job = await jobs.updateJob(
+        req.params.id,
+        update.status,
+        update.progress,
+        update.currentStage,
+        update.message,
+        { technicalMessage: update.technicalMessage },
+      );
+      if (update.stageKey && update.checkpointStatus) {
+        await jobs.updateStageCheckpoint(req.params.id, update.stageKey, update.checkpointStatus, {
+          input: update.inputHashSource,
+          provider: update.provider,
+          artifacts: update.artifacts,
+          error: update.technicalMessage,
           timingMs: update.timingMs,
         });
+        if (update.checkpointStatus === "completed") {
+          const webhookService = db ? new WebhookService(db, { timeoutMs: config.webhookTimeoutMs }) : null;
+          await webhookService?.dispatchEvent("job.stage.completed", {
+            jobId: req.params.id,
+            stage: update.stageKey,
+            timingMs: update.timingMs,
+          });
+        }
       }
+      res.status(200).json({ job });
+    } catch (error) {
+      sendJobMutationFailure(res, error, "POST /jobs/:id/progress");
     }
-    res.status(200).json({ job });
   });
 
   router.post("/jobs/:id/complete", async (req, res) => {
@@ -5815,114 +5927,118 @@ export function createV2InternalRouter(
       res.status(400).json({ error: "Invalid complete payload." });
       return;
     }
-    const completedMetadata = readMetadata(config.videosDirPath, parsed.data.videoId);
-    // V2.5.1 severity split. Older renders (and any path that predates the
-    // structured contract) carry no `finalQuality`; they are read the way they
-    // always were, as a hard failure.
-    const finalQuality = completedMetadata?.finalQuality;
-    const legacyRejected =
-      !finalQuality &&
-      (completedMetadata?.status === "failed" || completedMetadata?.professionalReady === false);
-    const hardFailed = finalQuality ? finalQuality.outcome === "failed" : legacyRejected;
-    const needsReview = finalQuality?.outcome === "needs_review";
+    try {
+      const completedMetadata = readMetadata(config.videosDirPath, parsed.data.videoId);
+      // V2.5.1 severity split. Older renders (and any path that predates the
+      // structured contract) carry no `finalQuality`; they are read the way they
+      // always were, as a hard failure.
+      const finalQuality = completedMetadata?.finalQuality;
+      const legacyRejected =
+        !finalQuality &&
+        (completedMetadata?.status === "failed" || completedMetadata?.professionalReady === false);
+      const hardFailed = finalQuality ? finalQuality.outcome === "failed" : legacyRejected;
+      const needsReview = finalQuality?.outcome === "needs_review";
 
-    if (hardFailed || needsReview) {
-      const rawMessage =
-        typeof completedMetadata?.error === "string" && completedMetadata.error.trim()
-          ? completedMetadata.error
-          : "Video failed final quality readiness checks.";
-      const { message } = classifyRenderFailure(rawMessage);
-      // A soft verdict keeps the render: the customer sees the exact reasons
-      // AND can still preview, download and publish the video that was
-      // actually produced. Throwing away a valid 1080p file over a creative
-      // preference is the defect this branch exists to prevent.
-      const status = hardFailed ? "failed" : "needs_review";
-      const stage = hardFailed ? "Quality review failed" : "Quality review";
-      const job = await jobs.updateJob(req.params.id, status, hardFailed ? 99 : 100, stage, message, {
-        error: message,
-        technicalError: rawMessage,
-        output: {
-          ...parsed.data.output,
-          videoId: parsed.data.videoId,
-          previewUrl: `/api/short-video/${parsed.data.videoId}`,
-          downloadUrl: `/api/videos/${parsed.data.videoId}/download`,
-          professionalReady: completedMetadata?.professionalReady,
-          validationStatus: completedMetadata?.status,
-          finalQuality,
-        },
-      });
+      if (hardFailed || needsReview) {
+        const rawMessage =
+          typeof completedMetadata?.error === "string" && completedMetadata.error.trim()
+            ? completedMetadata.error
+            : "Video failed final quality readiness checks.";
+        const { message } = classifyRenderFailure(rawMessage);
+        // A soft verdict keeps the render: the customer sees the exact reasons
+        // AND can still preview, download and publish the video that was
+        // actually produced. Throwing away a valid 1080p file over a creative
+        // preference is the defect this branch exists to prevent.
+        const status = hardFailed ? "failed" : "needs_review";
+        const stage = hardFailed ? "Quality review failed" : "Quality review";
+        const job = await jobs.updateJob(req.params.id, status, hardFailed ? 99 : 100, stage, message, {
+          error: message,
+          technicalError: rawMessage,
+          output: {
+            ...parsed.data.output,
+            videoId: parsed.data.videoId,
+            previewUrl: `/api/short-video/${parsed.data.videoId}`,
+            downloadUrl: `/api/videos/${parsed.data.videoId}/download`,
+            professionalReady: completedMetadata?.professionalReady,
+            validationStatus: completedMetadata?.status,
+            finalQuality,
+          },
+        });
+        if (db) {
+          await new WorkerLeaseService(db).release(process.env.WORKER_ID || "render-worker");
+          await new WebhookService(db, { timeoutMs: config.webhookTimeoutMs }).dispatchEvent(
+            hardFailed ? "job.failed" : "video.ready",
+            {
+              jobId: req.params.id,
+              videoId: parsed.data.videoId,
+              ...(hardFailed ? { error: message } : { output: parsed.data.output }),
+            } as any,
+          );
+          if (needsReview) {
+            // A reviewable production is still a delivered video: it gets the
+            // same revision/artifact bookkeeping a ready one gets, otherwise it
+            // would be missing from the Video Library and from retry reuse.
+            const revision = await new RevisionService(db).markRevisionReadyForJob(
+              req.params.id,
+              parsed.data.videoId,
+            );
+            if (!revision) {
+              await new RevisionService(db).ensureInitialRevision({
+                projectId: parsed.data.videoId,
+                sourceJobId: req.params.id,
+                outputVideoId: parsed.data.videoId,
+              });
+            }
+            if (completedMetadata?.durableArtifacts) {
+              await persistSceneArtifacts(
+                db,
+                revision?.projectId || parsed.data.videoId,
+                completedMetadata.durableArtifacts as DurableSceneArtifact[],
+              );
+            }
+          }
+        }
+        res.status(200).json({ job });
+        return;
+      }
+
+      const job = await jobs.completeJob(
+        req.params.id,
+        parsed.data.videoId,
+        parsed.data.output,
+      );
       if (db) {
         await new WorkerLeaseService(db).release(process.env.WORKER_ID || "render-worker");
-        await new WebhookService(db, { timeoutMs: config.webhookTimeoutMs }).dispatchEvent(
-          hardFailed ? "job.failed" : "video.ready",
-          {
+        const revision = await new RevisionService(db).markRevisionReadyForJob(req.params.id, parsed.data.videoId);
+        const projectId = revision?.projectId || (completedMetadata?.revisionMetadata as any)?.parentVideoId || parsed.data.videoId;
+        if (completedMetadata?.durableArtifacts) {
+          await persistSceneArtifacts(db, projectId, completedMetadata.durableArtifacts as DurableSceneArtifact[]);
+        }
+        if (!revision) {
+          await new RevisionService(db).ensureInitialRevision({
+            projectId: parsed.data.videoId,
+            sourceJobId: req.params.id,
+            outputVideoId: parsed.data.videoId,
+          });
+        }
+        await new WebhookService(db, { timeoutMs: config.webhookTimeoutMs }).dispatchEvent("video.ready", {
+          jobId: req.params.id,
+          videoId: parsed.data.videoId,
+          output: parsed.data.output,
+        });
+        if (revision) {
+          await new WebhookService(db, { timeoutMs: config.webhookTimeoutMs }).dispatchEvent("video.revision.ready", {
             jobId: req.params.id,
-            videoId: parsed.data.videoId,
-            ...(hardFailed ? { error: message } : { output: parsed.data.output }),
-          } as any,
-        );
-        if (needsReview) {
-          // A reviewable production is still a delivered video: it gets the
-          // same revision/artifact bookkeeping a ready one gets, otherwise it
-          // would be missing from the Video Library and from retry reuse.
-          const revision = await new RevisionService(db).markRevisionReadyForJob(
-            req.params.id,
-            parsed.data.videoId,
-          );
-          if (!revision) {
-            await new RevisionService(db).ensureInitialRevision({
-              projectId: parsed.data.videoId,
-              sourceJobId: req.params.id,
-              outputVideoId: parsed.data.videoId,
-            });
-          }
-          if (completedMetadata?.durableArtifacts) {
-            await persistSceneArtifacts(
-              db,
-              revision?.projectId || parsed.data.videoId,
-              completedMetadata.durableArtifacts as DurableSceneArtifact[],
-            );
-          }
+            revisionId: revision.id,
+            projectId: revision.projectId,
+            outputVideoId: parsed.data.videoId,
+          });
         }
       }
       res.status(200).json({ job });
-      return;
+    } catch (error) {
+      sendJobMutationFailure(res, error, "POST /jobs/:id/complete");
     }
-
-    const job = await jobs.completeJob(
-      req.params.id,
-      parsed.data.videoId,
-      parsed.data.output,
-    );
-    if (db) {
-      await new WorkerLeaseService(db).release(process.env.WORKER_ID || "render-worker");
-      const revision = await new RevisionService(db).markRevisionReadyForJob(req.params.id, parsed.data.videoId);
-      const projectId = revision?.projectId || (completedMetadata?.revisionMetadata as any)?.parentVideoId || parsed.data.videoId;
-      if (completedMetadata?.durableArtifacts) {
-        await persistSceneArtifacts(db, projectId, completedMetadata.durableArtifacts as DurableSceneArtifact[]);
-      }
-      if (!revision) {
-        await new RevisionService(db).ensureInitialRevision({
-          projectId: parsed.data.videoId,
-          sourceJobId: req.params.id,
-          outputVideoId: parsed.data.videoId,
-        });
-      }
-      await new WebhookService(db, { timeoutMs: config.webhookTimeoutMs }).dispatchEvent("video.ready", {
-        jobId: req.params.id,
-        videoId: parsed.data.videoId,
-        output: parsed.data.output,
-      });
-      if (revision) {
-        await new WebhookService(db, { timeoutMs: config.webhookTimeoutMs }).dispatchEvent("video.revision.ready", {
-          jobId: req.params.id,
-          revisionId: revision.id,
-          projectId: revision.projectId,
-          outputVideoId: parsed.data.videoId,
-        });
-      }
-    }
-    res.status(200).json({ job });
   });
 
   router.post("/jobs/:id/fail", async (req, res) => {
@@ -5935,30 +6051,34 @@ export function createV2InternalRouter(
       res.status(400).json({ error: "Invalid fail payload." });
       return;
     }
-    const current = await jobs.getJob(req.params.id);
-    const rawMessage = parsed.data.technicalMessage || parsed.data.message;
-    const classified = classifyRenderFailure(rawMessage);
-    const isArabic = current?.language === "ar" || (current?.productionSpec as any)?.language === "ar";
-    const message = isArabic ? CATEGORY_MESSAGES_AR[classified.category] : classified.message;
-    const job = await jobs.updateJob(
-      req.params.id,
-      "failed",
-      Math.min(99, Math.max(0, current?.progress || 99)),
-      current?.currentStage && current.currentStage !== "Queued" ? current.currentStage : "Failed",
-      message,
-      {
-        error: message,
-        technicalError: parsed.data.technicalMessage,
-      },
-    );
-    if (db) {
-      await new WorkerLeaseService(db).release(process.env.WORKER_ID || "render-worker");
-      await new WebhookService(db, { timeoutMs: config.webhookTimeoutMs }).dispatchEvent("video.failed", {
-        jobId: req.params.id,
-        message: parsed.data.message,
-      });
+    try {
+      const current = await jobs.getJob(req.params.id);
+      const rawMessage = parsed.data.technicalMessage || parsed.data.message;
+      const classified = classifyRenderFailure(rawMessage);
+      const isArabic = current?.language === "ar" || (current?.productionSpec as any)?.language === "ar";
+      const message = isArabic ? CATEGORY_MESSAGES_AR[classified.category] : classified.message;
+      const job = await jobs.updateJob(
+        req.params.id,
+        "failed",
+        Math.min(99, Math.max(0, current?.progress || 99)),
+        current?.currentStage && current.currentStage !== "Queued" ? current.currentStage : "Failed",
+        message,
+        {
+          error: message,
+          technicalError: parsed.data.technicalMessage,
+        },
+      );
+      if (db) {
+        await new WorkerLeaseService(db).release(process.env.WORKER_ID || "render-worker");
+        await new WebhookService(db, { timeoutMs: config.webhookTimeoutMs }).dispatchEvent("video.failed", {
+          jobId: req.params.id,
+          message: parsed.data.message,
+        });
+      }
+      res.status(200).json({ job });
+    } catch (error) {
+      sendJobMutationFailure(res, error, "POST /jobs/:id/fail");
     }
-    res.status(200).json({ job });
   });
 
   router.post("/render/jobs/:id/start", async (req, res) => {

@@ -11,8 +11,14 @@
 # mode accepts a pre-release version (2.4.0-rc.2, 2.4.0-beta.1, ...) as well
 # as a plain one, since it publishes nothing but a sha-<commit> tag - it
 # never creates a Git tag or a GitHub Release and never moves the version or
-# stable tag. promote/retag-stable move real customer-facing tags, so both
-# require a plain stable version (X.Y.Z) and are refused for a pre-release,
+# stable tag.
+#
+# The digest candidate mode reports is containerimage.digest from buildx
+# --metadata-file, the same field docker/build-push-action outputs. A later
+# inspect only confirms the tag; it is not where the digest comes from.
+#
+# promote/retag-stable move real customer-facing tags, so both require a
+# plain stable version (X.Y.Z) and are refused for a pre-release,
 # even if candidate mode already built one - promotion happens only after
 # the release is approved.
 #
@@ -178,12 +184,16 @@ jobs:
 
       # v2.Dockerfile builds every layer it needs, so the candidate image
       # comes out of one build with no separate base tag to stay in step with.
+      # --metadata-file records containerimage.digest for the manifest that was
+      # pushed. Only the sha-<commit> tag is published here. Version and stable
+      # tags are left untouched; those move only in promote / retag-stable.
       - name: Build and push candidate image
         id: push
         if: inputs.mode == 'candidate'
         run: |
           set -euo pipefail
           IMAGE="${{ steps.identity.outputs.image }}:${{ steps.identity.outputs.tag }}"
+          META="${RUNNER_TEMP}/candidate-image-metadata.json"
           docker buildx build \
             --platform linux/amd64 \
             --file v2.Dockerfile \
@@ -195,27 +205,39 @@ jobs:
             --label "org.opencontainers.image.source=${{ steps.identity.outputs.source }}" \
             --label "org.opencontainers.image.created=${{ steps.identity.outputs.created }}" \
             --label "org.opencontainers.image.licenses=MIT" \
+            --metadata-file "$META" \
             --push \
             .
-
-      - name: Resolve pushed candidate digest
-        id: digest
-        if: inputs.mode == 'candidate'
-        run: |
-          set -euo pipefail
-          IMAGE="${{ steps.identity.outputs.image }}:${{ steps.identity.outputs.tag }}"
-          DIGEST="$(docker buildx imagetools inspect "$IMAGE" | awk '/^Digest:/ {print $2; exit}')"
+          DIGEST="$(bash scripts/release/ghcr-candidate-digest.sh from-metadata "$META")"
           if ! [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
-            echo "::error::Could not resolve a valid digest for $IMAGE."
+            echo "::error::Build metadata digest was not sha256:<64 hex> (got '${DIGEST}')."
             exit 1
           fi
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Pushed $IMAGE@$DIGEST"
+
+      # Confirm the tag reads back as the digest the push recorded. The inspect
+      # output is captured whole and then parsed. Piping imagetools inspect into
+      # `awk '/^Digest:/ {exit}'` closes the pipe early; buildx dies on SIGPIPE
+      # and the docker CLI reports exit 255 with no error text. That is how run
+      # 37286481317 failed after a successful push. See ghcr-candidate-digest.sh.
+      - name: Resolve pushed candidate digest
+        id: digest
+        if: inputs.mode == 'candidate'
+        env:
+          IMAGE: ${{ steps.identity.outputs.image }}:${{ steps.identity.outputs.tag }}
+          EXPECTED_DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          echo "Push recorded digest ${EXPECTED_DIGEST}"
+          bash scripts/release/ghcr-candidate-digest.sh confirm
+          echo "digest=${EXPECTED_DIGEST}" >> "$GITHUB_OUTPUT"
           {
             echo "### GHCR candidate"
             echo ""
             echo "- Image: \`${{ steps.identity.outputs.image }}\`"
             echo "- Tag: \`${{ steps.identity.outputs.tag }}\`"
-            echo "- Digest: \`$DIGEST\`"
+            echo "- Digest: \`${EXPECTED_DIGEST}\`"
             echo "- Revision: \`${{ steps.identity.outputs.sha }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
